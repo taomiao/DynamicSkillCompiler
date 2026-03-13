@@ -7,6 +7,14 @@ from skillnet_ai.downloader import SkillDownloader
 from skillnet_ai.evaluator import SkillEvaluator, EvaluatorConfig
 from skillnet_ai.searcher import SkillNetSearcher
 from skillnet_ai.analyzer import SkillRelationshipAnalyzer
+from skillnet_ai.compiler import (
+    CompilerConfig,
+    CompositeSkillRetriever,
+    DynamicSkillCompiler,
+    LocalEnvironment,
+    LocalSkillLibraryRetriever,
+    SkillNetSearchRetriever,
+)
 
 class SkillNetError(Exception):
     """Custom exception class for SkillNet Client errors."""
@@ -314,3 +322,113 @@ class SkillNetClient:
             return results
         except Exception as e:
             raise SkillNetError(f"Relationship analysis failed: {str(e)}") from e
+
+    def compile_skills(
+        self,
+        query: str,
+        local_skills_dir: Optional[Union[str, Path]] = None,
+        search_limit: int = 20,
+        vector_threshold: float = 0.7,
+        min_relevance: float = 0.25,
+        preserve_top_k: int = 2,
+        similar_prune_margin: float = 0.08,
+        keep_parent_if_better_by: float = 0.05,
+        coverage_weight: float = 0.55,
+        quality_weight: float = 0.20,
+        cost_weight: float = 0.15,
+        latency_weight: float = 0.10,
+        cwd: Optional[Union[str, Path]] = None,
+        workspace_root: Optional[Union[str, Path]] = None,
+        python_bin: str = "python",
+        shell: str = "sh",
+        os_name: str = "unknown",
+        available_bins: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compile a task-specific, de-duplicated skill package for the given query.
+
+        This method combines local skill-library retrieval with SkillNet search retrieval,
+        constructs a multi-relational skill graph, then prunes and localizes it for the
+        current environment.
+        """
+        retrievers = []
+        if local_skills_dir:
+            retrievers.append(LocalSkillLibraryRetriever(str(local_skills_dir)))
+        retrievers.append(
+            SkillNetSearchRetriever(
+                searcher=SkillNetSearcher(),
+                limit=search_limit,
+                threshold=vector_threshold,
+            )
+        )
+
+        compiler = DynamicSkillCompiler(
+            retriever=CompositeSkillRetriever(retrievers=retrievers),
+            config=CompilerConfig(
+                min_relevance=min_relevance,
+                preserve_top_k=preserve_top_k,
+                similar_prune_margin=similar_prune_margin,
+                keep_parent_if_better_by=keep_parent_if_better_by,
+                coverage_weight=coverage_weight,
+                quality_weight=quality_weight,
+                cost_weight=cost_weight,
+                latency_weight=latency_weight,
+            ),
+        )
+        environment = LocalEnvironment(
+            cwd=str(cwd or os.getcwd()),
+            workspace_root=str(workspace_root or os.getcwd()),
+            python_bin=python_bin,
+            shell=shell,
+            os_name=os_name,
+            available_bins=set(available_bins or []),
+        )
+        compiled = compiler.compile(query=query, environment=environment)
+
+        return {
+            "summary": DynamicSkillCompiler.summarize(compiled),
+            "subgoals": [
+                {
+                    "subgoal_id": subgoal.subgoal_id,
+                    "description": subgoal.description,
+                    "required_capabilities": sorted(subgoal.required_capabilities),
+                    "depends_on": subgoal.depends_on,
+                    "environment_hints": subgoal.environment_hints,
+                }
+                for subgoal in compiled.subgoals
+            ],
+            "execution_order": compiled.execution_order,
+            "selected_skills": [
+                {
+                    "skill_id": item.asset.skill_id,
+                    "name": item.asset.name,
+                    "location": item.asset.location,
+                    "utility_score": item.utility_score,
+                    "assigned_subgoals": item.assigned_subgoals,
+                    "selected_fragments": [
+                        {
+                            "fragment_id": fragment.fragment_id,
+                            "content": fragment.content,
+                            "example_actions": fragment.example_actions,
+                        }
+                        for fragment in item.selected_fragments
+                    ],
+                    "localized_instructions": item.localized_instructions,
+                    "selected_reason": item.selected_reason,
+                }
+                for item in compiled.compiled_skills
+            ],
+            "relations": [
+                {
+                    "source": relation.source,
+                    "target": relation.target,
+                    "type": relation.relation_type,
+                    "weight": relation.weight,
+                    "reason": relation.reason,
+                }
+                for relation in compiled.graph.relations
+            ],
+            "metrics": compiled.metrics.__dict__,
+            "dropped_skills": compiled.dropped_skills,
+            "notes": compiled.notes,
+        }

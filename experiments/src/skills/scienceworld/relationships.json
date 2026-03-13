@@ -1,0 +1,104 @@
+[
+  {
+    "source": "scienceworld-room-teleporter",
+    "target": "scienceworld-room-navigator",
+    "type": "similar_to",
+    "reason": "Both skills teleport the agent to a specified room and are functionally interchangeable for navigation."
+  },
+  {
+    "source": "scienceworld-room-explorer",
+    "target": "scienceworld-room-scanner",
+    "type": "similar_to",
+    "reason": "Both perform a 'look around' or survey of the current room to list visible objects."
+  },
+  {
+    "source": "scienceworld-environment-scanner",
+    "target": "scienceworld-room-scanner",
+    "type": "similar_to",
+    "reason": "Both scan the current location and output a detailed room description for situational awareness."
+  },
+  {
+    "source": "scienceworld-temperature-measurer",
+    "target": "scienceworld-measurement-taker",
+    "type": "belong_to",
+    "reason": "Temperature measurement is a specific case of the more general measurement-taking skill."
+  },
+  {
+    "source": "scienceworld-measurement-taker",
+    "target": "scienceworld-threshold-evaluator",
+    "type": "compose_with",
+    "reason": "A measurement-taker produces a numeric value that a threshold evaluator then consumes to decide a conditional outcome."
+  },
+  {
+    "source": "scienceworld-conditional-box-placer",
+    "target": "scienceworld-threshold-evaluator",
+    "type": "depend_on",
+    "reason": "Conditional box placement requires a threshold evaluation result to decide which container to use."
+  },
+  {
+    "source": "scienceworld-conditional-placer",
+    "target": "scienceworld-conditional-box-placer",
+    "type": "similar_to",
+    "reason": "Both place an object into containers based on a numeric condition or threshold."
+  },
+  {
+    "source": "scienceworld-circuit-builder",
+    "target": "scienceworld-circuit-connector",
+    "type": "depend_on",
+    "reason": "Building a circuit relies on the ability to connect components with the connector skill."
+  },
+  {
+    "source": "scienceworld-conductivity-tester",
+    "target": "scienceworld-circuit-builder",
+    "type": "compose_with",
+    "reason": "Conductivity testing integrates a completed circuit built by the circuit-builder to observe a light bulb reaction."
+  },
+  {
+    "source": "scienceworld-item-fetcher",
+    "target": "scienceworld-object-retriever",
+    "type": "similar_to",
+    "reason": "Both pick up an object from the environment and move it into the agent's inventory."
+  },
+  {
+    "source": "scienceworld-recipe-retriever",
+    "target": "scienceworld-instruction-reader",
+    "type": "compose_with",
+    "reason": "After retrieving a recipe document, the instruction-reader skill is used to extract and parse its contents."
+  },
+  {
+    "source": "soil-extraction",
+    "target": "scienceworld-pot-preparer",
+    "type": "depend_on",
+    "reason": "Pot preparation requires soil first obtained by the soil-extraction skill."
+  },
+  {
+    "source": "scienceworld-pot-preparer",
+    "target": "scienceworld-planting-coordinator",
+    "type": "depend_on",
+    "reason": "Planting coordination depends on having a prepared pot available."
+  },
+  {
+    "source": "scienceworld-planting-coordinator",
+    "target": "scienceworld-growth-focuser",
+    "type": "depend_on",
+    "reason": "Focusing on plant growth only makes sense after a seed has been planted by the planting-coordinator."
+  },
+  {
+    "source": "scienceworld-growth-focuser",
+    "target": "scienceworld-controlled-waiting",
+    "type": "compose_with",
+    "reason": "Monitoring plant development often pairs a focus action with timed waits to allow growth."
+  },
+  {
+    "source": "scienceworld-substance-fetcher",
+    "target": "scienceworld-container-item-retriever",
+    "type": "similar_to",
+    "reason": "Both skills retrieve a target item or substance from a container into the agent's inventory."
+  },
+  {
+    "source": "scienceworld-tool-fetcher",
+    "target": "scienceworld-item-fetcher",
+    "type": "belong_to",
+    "reason": "Fetching a specific tool is a specialized instance of the more general item-fetching skill."
+  }
+]

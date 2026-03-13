@@ -1,25 +1,44 @@
 import os
 from openai import OpenAI
 import re
-from retry import retry
+try:
+    from retry import retry
+except ImportError:
+    def retry(*_args, **_kwargs):
+        def decorator(func):
+            return func
+        return decorator
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import json
 import argparse
 import yaml
-import alfworld
-import alfworld.agents.environment
-from alfworld.agents.environment import get_environment
 import sys
 
 from src.alfworld.prompts.system_prompt import alfworld_system_prompt
 from src.skill import SkillModule
 
-client = OpenAI(
-    api_key=os.environ["API_KEY"],
-    base_url=os.environ["BASE_URL"]
-)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+alfworld_path = os.path.join(current_dir, "alfworld")
+if os.path.isdir(alfworld_path) and alfworld_path not in sys.path:
+    sys.path.append(alfworld_path)
+
+import alfworld
+import alfworld.agents.environment
+from alfworld.agents.environment import get_environment
+
+client = None
+
+
+def get_client():
+    global client
+    if client is None:
+        client = OpenAI(
+            api_key=os.environ["API_KEY"],
+            base_url=os.environ["BASE_URL"]
+        )
+    return client
 
 @retry(tries=5, delay=5, backoff=2, jitter=(1, 3))
 def llm(prompt, model="YOUR_MODEL_NAME"):
@@ -31,7 +50,7 @@ def llm(prompt, model="YOUR_MODEL_NAME"):
         messages = [{"role": "user", "content": prompt}]
     else:
         raise ValueError(f'prompt must be a list or a string, but got {type(prompt)}')
-    response = client.chat.completions.create(
+    response = get_client().chat.completions.create(
         model=model,
         messages=messages
     )
@@ -198,7 +217,13 @@ def alfworld_run_single(env, obs=[], names=[], max_steps=30, model=None, Skill_M
             "reward": task_reward,
             "steps": steps,
             "messages": messages,
-            "relevant_skill_names": relevant_skill_names
+            "relevant_skill_names": relevant_skill_names,
+            "skill_strategy": getattr(Skill_Module, "selection_strategy", "none") if Skill_Module else "none",
+            "compiler_metrics": (
+                Skill_Module.last_compilation.metrics.__dict__
+                if Skill_Module and Skill_Module.last_compilation is not None
+                else None
+            ),
         })
     
     return results
@@ -227,7 +252,16 @@ def eval_single_game(game_idx, args, config, split, output_path):
                 "skills_dir": "src/skills/alfworld",
                 "overall_procedure_examples_path": "src/alfworld/alfworld_overall_procedure_examples.txt",
                 "procedure_code_template_path": "src/alfworld/alfworld_procedure_code_template.py",
-                "model": args.model
+                "model": args.model,
+                "selection_strategy": args.skill_strategy,
+                "compiler_min_relevance": args.compiler_min_relevance,
+                "compiler_preserve_top_k": args.compiler_preserve_top_k,
+                "compiler_similar_prune_margin": args.compiler_similar_prune_margin,
+                "compiler_keep_parent_if_better_by": args.compiler_keep_parent_if_better_by,
+                "compiler_coverage_weight": args.compiler_coverage_weight,
+                "compiler_quality_weight": args.compiler_quality_weight,
+                "compiler_cost_weight": args.compiler_cost_weight,
+                "compiler_latency_weight": args.compiler_latency_weight,
             }
             Skill_Module = SkillModule(**skill_config)
 
@@ -268,6 +302,7 @@ def eval_single_game(game_idx, args, config, split, output_path):
 
 def main(args):
     model_name = args.model
+    skill_mode = args.skill_strategy if args.use_skill else "none"
     
     # Load configuration
     with open('src/alfworld/base_config.yaml') as reader:
@@ -277,7 +312,7 @@ def main(args):
     split = "eval_in_distribution" if args.split == 'dev' else "eval_out_of_distribution"
 
     # Setup output directory
-    output_path = f'results/alfworld/{model_name}/{args.split}_{args.exp_name}_skill_{args.use_skill}'
+    output_path = f'results/alfworld/{model_name}/{args.split}_{args.exp_name}_skill_{skill_mode}'
     if not os.path.exists(output_path):
         os.makedirs(output_path, exist_ok=True)
 
@@ -321,6 +356,9 @@ def main(args):
         if idx not in existing_files:
             tasks_to_run.append(idx)
 
+    if args.task_limit is not None:
+        tasks_to_run = tasks_to_run[: args.task_limit]
+
     print(f"Already finished: {finished_games}, Remaining: {len(tasks_to_run)}")
 
     # ---------------------------------------------------------
@@ -329,44 +367,55 @@ def main(args):
     max_workers = args.max_workers
     print(f"Starting parallel evaluation with {max_workers} workers...")
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
-        future_to_idx = {
-            executor.submit(
-                eval_single_game, 
-                idx, 
-                args, 
-                config, 
-                split, 
-                output_path
-            ): idx for idx in tasks_to_run
-        }
-
-        # Monitor progress with tqdm
-        pbar = tqdm(total=len(tasks_to_run), desc="Evaluating ALFWorld")
-        
-        for future in concurrent.futures.as_completed(future_to_idx):
-            idx = future_to_idx[future]
+    pbar = tqdm(total=len(tasks_to_run), desc="Evaluating ALFWorld")
+    if max_workers <= 1:
+        for idx in tasks_to_run:
             try:
-                result = future.result()
+                result = eval_single_game(idx, args, config, split, output_path)
                 if result:
                     finished_games += 1
                     all_rewards += result['reward']
                     all_steps += result['steps']
-                    
-                    # Update progress bar description
                     current_avg_reward = all_rewards / finished_games if finished_games > 0 else 0
                     current_avg_steps = all_steps / finished_games if finished_games > 0 else 0
                     pbar.set_postfix({
-                        'Avg Reward': f'{current_avg_reward:.2f}', 
+                        'Avg Reward': f'{current_avg_reward:.2f}',
                         'Avg Steps': f'{current_avg_steps:.2f}'
                     })
             except Exception as exc:
                 print(f'\nGame {idx} generated an exception: {exc}')
-            
             pbar.update(1)
-        
-        pbar.close()
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx = {
+                executor.submit(
+                    eval_single_game,
+                    idx,
+                    args,
+                    config,
+                    split,
+                    output_path
+                ): idx for idx in tasks_to_run
+            }
+
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    result = future.result()
+                    if result:
+                        finished_games += 1
+                        all_rewards += result['reward']
+                        all_steps += result['steps']
+                        current_avg_reward = all_rewards / finished_games if finished_games > 0 else 0
+                        current_avg_steps = all_steps / finished_games if finished_games > 0 else 0
+                        pbar.set_postfix({
+                            'Avg Reward': f'{current_avg_reward:.2f}',
+                            'Avg Steps': f'{current_avg_steps:.2f}'
+                        })
+                except Exception as exc:
+                    print(f'\nGame {idx} generated an exception: {exc}')
+                pbar.update(1)
+    pbar.close()
 
     # Final Summary
     print(f"Evaluation finished. Total Games: {finished_games}")
@@ -382,6 +431,16 @@ if __name__ == '__main__':
     parser.add_argument('--max_steps', type=int, default=30)
     parser.add_argument('--exp_name', type=str, default='')
     parser.add_argument('--use_skill', action='store_true')
+    parser.add_argument('--skill_strategy', type=str, default='baseline', choices=['baseline', 'dsc'])
+    parser.add_argument('--compiler_min_relevance', type=float, default=0.25)
+    parser.add_argument('--compiler_preserve_top_k', type=int, default=2)
+    parser.add_argument('--compiler_similar_prune_margin', type=float, default=0.08)
+    parser.add_argument('--compiler_keep_parent_if_better_by', type=float, default=0.05)
+    parser.add_argument('--compiler_coverage_weight', type=float, default=0.55)
+    parser.add_argument('--compiler_quality_weight', type=float, default=0.20)
+    parser.add_argument('--compiler_cost_weight', type=float, default=0.15)
+    parser.add_argument('--compiler_latency_weight', type=float, default=0.10)
+    parser.add_argument('--task_limit', type=int, default=None)
     args = parser.parse_args()
         
     main(args)

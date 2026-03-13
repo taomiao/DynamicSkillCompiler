@@ -68,7 +68,8 @@ def overall_procedure_code(
         # 3) ACTION PARSING PHASE — Extract executable command
         #    Expected format: "Action: <command>"
         # ============================================================
-        action = parse_action(response)
+        last_observation = messages[-1]["content"] if messages and messages[-1]["role"] == "user" else ""
+        action = parse_action(response, last_observation)
 
         # ============================================================
         # 4) ENVIRONMENT INTERACTION PHASE — Execute Action

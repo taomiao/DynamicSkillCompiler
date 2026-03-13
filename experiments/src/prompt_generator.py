@@ -1,11 +1,20 @@
-def retrieve_relevant_skills_prompt(metadata, task):
+def retrieve_relevant_skills_prompt(metadata, task, max_skills=5, candidate_mode=False):
     template = "You are an expert in task analysis and skills retrieval."
+    selection_rule = (
+        f"Match the task requirements with the most relevant skills based on the metadata descriptions. "
+        f"Include a broader but still high-signal candidate pool for downstream compilation. "
+        f"(Target {max_skills} skills, and do not exceed {max_skills + 2} unless absolutely necessary)"
+        if candidate_mode
+        else f"Match the task requirements with the most relevant skills based on the metadata descriptions. "
+             f"Only include skills that are most helpful for accomplishing the task. "
+             f"(No more than {max_skills} unless necessary)"
+    )
     prompt = f'''
 Your task is to analyze the given task description and retrieve the most relevant skills from the provided metadata (name and description pairs).
 
 # Principles
 1.  **Contextual Understanding**: Thoroughly analyze the task description to grasp its requirements.
-2.  **Relevance Matching**: Match the task requirements with the most relevant skills based on the metadata descriptions. Only include skills that are most helpful for accomplishing the task. (No more than 5 unless necessary)
+2.  **Relevance Matching**: {selection_rule}
 3.  **Clarity and Precision**: Clearly list the names of the relevant skills in your output.
 4.  **Output Format**: Return the skill names as a JSON list of strings. Must strictly match names in the provided metadata.
 5.  **Allow Empty List**: If no relevant skills are found, return an empty list `[]`.
@@ -23,7 +32,7 @@ Keep your output in the format below:
     return [{"role": "system", "content": template}, {"role": "user", "content": prompt}]
 
 
-def generate_overall_procedure_prompt(task, overall_procedure_examples, skill_contents):
+def generate_overall_procedure_prompt(task, overall_procedure_examples, skill_contents, compiler_summary=""):
     template = "You are a Senior Systems Architect."
     prompt = f'''
 You are given a complex task description, relevant skill contents, and examples of well-structured procedural guidance texts.
@@ -34,11 +43,18 @@ Your task is to create a structured "Procedural Guidance" text. This text will s
 2.  **Use Exact Syntax**: When describing actions, you MUST quote the exact syntax from the "Available Actions" (e.g., use "go to {{recep}}" instead of "walk to the desk").
 3.  **State & Preconditions**: Explicitly mention necessary preconditions (e.g., "If the drawer is closed, use 'open drawer' before taking").
 4.  **Error Handling**: Include a rule for what to do if the agent encounters an error or unexpected situation.
+5.  **Observation Grounding**: Do NOT hard-code object colors, wire colors, bulbs, boxes, rooms, or container mappings unless they are explicitly stated in the task description or must be confirmed from environment observation first.
+6.  **No Invented Components**: If a skill mentions example components, treat them as patterns only. Your procedure must tell the agent to inspect the current environment and use the components that actually exist in this variation.
+7.  **Executable Electrical Syntax**: For electrical tasks, do not emit abstract commands like `connect X to Y`. Require exact contact-point actions based on observation, such as `battery anode`, `battery cathode`, `wire terminal 1`, `wire terminal 2`, `bulb anode`, `bulb cathode`, or object `terminal 1/2`.
+8.  **Separate Tool Search from Target Search**: If the task requires both a tool and a target object, write separate phases for locating/acquiring the tool and locating/acquiring the target. Do not assume they are in the same room.
+9.  **Ambiguity Handling**: If the environment returns `Ambiguous request: Please enter the number...`, the next action must be only the selected index, such as `0`, not a restated object name.
 
 # Input Data
 1.  **Task Description:**
 {task}
-2.  **Relevant Skill Contents:**
+2.  **Compiler Summary / Compiled Skill Package:**
+{compiler_summary if compiler_summary else "[No compiler summary provided]"}
+3.  **Relevant Skill Contents:**
 {skill_contents}
 
 # Examples

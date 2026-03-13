@@ -11,7 +11,7 @@ SkillNet/
 ├── experiments/
 │   ├── alfworld/          # git clone here
 │   ├── ScienceWorld/      # git clone here
-│   ├── WebShop/           # git clone here
+│   ├── WebShop/           # git clone here (or rename to webshop)
 │   ├── src/
 │   ├── requirements.txt
 │   ├── alfworld_run.py
@@ -56,6 +56,8 @@ We suggest configuring separate conda environments for these three datasets to a
   # Refer to the WebShop repository for environment setup (https://github.com/princeton-nlp/WebShop)
   ```
 
+  The evaluation script now accepts either `experiments/WebShop` or `experiments/webshop`.
+
 ---
 
 For each environment, install common dependencies:
@@ -78,13 +80,16 @@ Run the corresponding evaluation script from the `experiments/` directory.
 cd experiments
 
 # ALFWorld
-python alfworld_run.py --model o4-mini --split dev --max_workers 10 --exp_name alf_test --use_skill
+python alfworld_run.py --model o4-mini --split dev --max_workers 10 --exp_name alf_test --use_skill --skill_strategy baseline
+python alfworld_run.py --model o4-mini --split dev --max_workers 10 --exp_name alf_test_dsc --use_skill --skill_strategy dsc
 
 # ScienceWorld
-python scienceworld_run.py --model o4-mini --split test --max_workers 5 --exp_name sci_test --use_skill
+python scienceworld_run.py --model o4-mini --split test --max_workers 5 --exp_name sci_test --use_skill --skill_strategy baseline
+python scienceworld_run.py --model o4-mini --split test --max_workers 5 --exp_name sci_test_dsc --use_skill --skill_strategy dsc --compiler_min_relevance 0.15 --compiler_preserve_top_k 3
 
 # WebShop
-python webshop_run.py --model o4-mini --max_workers 3 --exp_name web_test --use_skill
+python webshop_run.py --model o4-mini --max_workers 3 --exp_name web_test --use_skill --skill_strategy baseline
+python webshop_run.py --model o4-mini --max_workers 3 --exp_name web_test_dsc --use_skill --skill_strategy dsc
 ```
 
 #### 🛠️ Argument Descriptions
@@ -97,3 +102,26 @@ python webshop_run.py --model o4-mini --max_workers 3 --exp_name web_test --use_
 - `exp_name`: results save name.
 
 - `--use_skill`: Enable the skill-augmented module.
+
+- `--skill_strategy`: `baseline` uses the original skill retrieval path, `dsc` enables Dynamic Skill Compiler.
+
+- `--compiler_min_relevance`: pruning threshold for DSC.
+
+- `--compiler_preserve_top_k`: always keep at least the top-k scored skills.
+
+- `--compiler_similar_prune_margin`: only prune `similar_to` alternatives when the score gap exceeds this margin.
+
+- `--compiler_keep_parent_if_better_by`: only drop parent/container skills when the child is better by this margin.
+
+- `--compiler_coverage_weight` / `--compiler_quality_weight` / `--compiler_cost_weight` / `--compiler_latency_weight`: scoring weights for DSC.
+
+### Step 3: Summarize Results
+
+After runs finish, aggregate them into JSON/Markdown:
+
+```bash
+python summarize_results.py \
+  --results-root results/scienceworld/o4-mini \
+  --json-out results/scienceworld/o4-mini/summary.json \
+  --md-out results/scienceworld/o4-mini/summary.md
+```

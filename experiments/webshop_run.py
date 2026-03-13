@@ -1,7 +1,13 @@
 import os
 from openai import OpenAI
 import re
-from retry import retry
+try:
+    from retry import retry
+except ImportError:
+    def retry(*_args, **_kwargs):
+        def decorator(func):
+            return func
+        return decorator
 import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -17,16 +23,27 @@ from src.webshop.prompts.system_prompt import webshop_system_prompt
 from src.skill import SkillModule
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-webshop_path = os.path.join(current_dir, "webshop")
+webshop_candidates = [
+    os.path.join(current_dir, "webshop"),
+    os.path.join(current_dir, "WebShop"),
+]
+webshop_path = next((path for path in webshop_candidates if os.path.isdir(path)), webshop_candidates[0])
 if webshop_path not in sys.path:
     sys.path.append(webshop_path)
-from webshop.web_agent_site.envs import WebAgentTextEnv
+from web_agent_site.envs import WebAgentTextEnv
 
 
-client = OpenAI(
-    api_key=os.environ["API_KEY"],
-    base_url=os.environ["BASE_URL"]
-)
+client = None
+
+
+def get_client():
+    global client
+    if client is None:
+        client = OpenAI(
+            api_key=os.environ["API_KEY"],
+            base_url=os.environ["BASE_URL"]
+        )
+    return client
 
 @retry(tries=5, delay=5, backoff=2, jitter=(1, 3))
 def llm(prompt, model="YOUR_MODEL_NAME"):
@@ -37,7 +54,7 @@ def llm(prompt, model="YOUR_MODEL_NAME"):
         messages = [{"role": "user", "content": prompt}]
     else:
         raise ValueError(f'prompt must be a list or a string, but got {type(prompt)}')
-    response = client.chat.completions.create(
+    response = get_client().chat.completions.create(
         model=model,
         messages=messages
     )
@@ -156,7 +173,13 @@ def webshop_run_single(env, ob, instruction_text, max_steps=30, model=None, Skil
         "reward": task_reward,
         "steps": steps,
         "messages": messages,
-        "relevant_skill_names": relevant_skill_names
+        "relevant_skill_names": relevant_skill_names,
+        "skill_strategy": getattr(Skill_Module, "selection_strategy", "none") if Skill_Module else "none",
+        "compiler_metrics": (
+            Skill_Module.last_compilation.metrics.__dict__
+            if Skill_Module and Skill_Module.last_compilation is not None
+            else None
+        ),
     })
     
     return results
@@ -181,7 +204,16 @@ def eval_single_game(game_idx, session_id, args, output_path):
                 "skills_dir": "src/skills/webshop",
                 "overall_procedure_examples_path": "src/webshop/webshop_overall_procedure_examples.txt",
                 "procedure_code_template_path": "src/webshop/webshop_procedure_code_template.py",
-                "model": args.model
+                "model": args.model,
+                "selection_strategy": args.skill_strategy,
+                "compiler_min_relevance": args.compiler_min_relevance,
+                "compiler_preserve_top_k": args.compiler_preserve_top_k,
+                "compiler_similar_prune_margin": args.compiler_similar_prune_margin,
+                "compiler_keep_parent_if_better_by": args.compiler_keep_parent_if_better_by,
+                "compiler_coverage_weight": args.compiler_coverage_weight,
+                "compiler_quality_weight": args.compiler_quality_weight,
+                "compiler_cost_weight": args.compiler_cost_weight,
+                "compiler_latency_weight": args.compiler_latency_weight,
             }
             Skill_Module = SkillModule(**skill_config)
 
@@ -219,7 +251,8 @@ def main(args):
         pass
 
     model_name = args.model
-    output_path = f'results/webshop/{model_name}/{args.exp_name}_skill_{args.use_skill}'
+    skill_mode = args.skill_strategy if args.use_skill else "none"
+    output_path = f'results/webshop/{model_name}/{args.exp_name}_skill_{skill_mode}'
     if not os.path.exists(output_path):
         os.makedirs(output_path, exist_ok=True)
 
@@ -258,6 +291,10 @@ def main(args):
             # tasks_to_run.append(idx)
             tasks_to_run[idx] = session_ids[idx]
 
+    if args.task_limit is not None:
+        limited_items = list(tasks_to_run.items())[: args.task_limit]
+        tasks_to_run = dict(limited_items)
+
     print(f"Already finished: {finished_games}, Remaining: {len(tasks_to_run)}")
 
 
@@ -266,35 +303,48 @@ def main(args):
     # ---------------------------------------------------------
     print(f"Starting parallel evaluation with {args.max_workers} workers...")
 
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
-        future_to_idx = {
-            executor.submit(eval_single_game, idx, session_id, args, output_path): idx 
-            for idx, session_id in tasks_to_run.items()
-        }
-        # Monitor progress with tqdm
-        pbar = tqdm(total=len(tasks_to_run), desc="Evaluating WebShop")
-        for future in concurrent.futures.as_completed(future_to_idx):
-            idx = future_to_idx[future]
+    pbar = tqdm(total=len(tasks_to_run), desc="Evaluating WebShop")
+    if args.max_workers <= 1:
+        for idx, session_id in tasks_to_run.items():
             try:
-                result = future.result()
+                result = eval_single_game(idx, session_id, args, output_path)
                 if result:
                     finished_games += 1
                     all_rewards += result['reward']
                     all_steps += result['steps']
-                    
-                    # Update progress bar description
                     current_avg_reward = all_rewards / finished_games if finished_games > 0 else 0
                     current_avg_steps = all_steps / finished_games if finished_games > 0 else 0
                     pbar.set_postfix({
-                        'Avg Reward': f'{current_avg_reward:.2f}', 
+                        'Avg Reward': f'{current_avg_reward:.2f}',
                         'Avg Steps': f'{current_avg_steps:.2f}'
                     })
             except Exception as exc:
                 print(f'\nGame {idx} generated an exception: {exc}')
-            
             pbar.update(1)
-        
-        pbar.close()
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
+            future_to_idx = {
+                executor.submit(eval_single_game, idx, session_id, args, output_path): idx
+                for idx, session_id in tasks_to_run.items()
+            }
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    result = future.result()
+                    if result:
+                        finished_games += 1
+                        all_rewards += result['reward']
+                        all_steps += result['steps']
+                        current_avg_reward = all_rewards / finished_games if finished_games > 0 else 0
+                        current_avg_steps = all_steps / finished_games if finished_games > 0 else 0
+                        pbar.set_postfix({
+                            'Avg Reward': f'{current_avg_reward:.2f}',
+                            'Avg Steps': f'{current_avg_steps:.2f}'
+                        })
+                except Exception as exc:
+                    print(f'\nGame {idx} generated an exception: {exc}')
+                pbar.update(1)
+    pbar.close()
 
     # Final Summary
     print(f"Evaluation finished. Total Games: {finished_games}")
@@ -309,5 +359,15 @@ if __name__ == '__main__':
     parser.add_argument('--max_steps', type=int, default=30)
     parser.add_argument('--exp_name', type=str, default='')
     parser.add_argument('--use_skill', action='store_true')
+    parser.add_argument('--skill_strategy', type=str, default='baseline', choices=['baseline', 'dsc'])
+    parser.add_argument('--compiler_min_relevance', type=float, default=0.25)
+    parser.add_argument('--compiler_preserve_top_k', type=int, default=2)
+    parser.add_argument('--compiler_similar_prune_margin', type=float, default=0.08)
+    parser.add_argument('--compiler_keep_parent_if_better_by', type=float, default=0.05)
+    parser.add_argument('--compiler_coverage_weight', type=float, default=0.55)
+    parser.add_argument('--compiler_quality_weight', type=float, default=0.20)
+    parser.add_argument('--compiler_cost_weight', type=float, default=0.15)
+    parser.add_argument('--compiler_latency_weight', type=float, default=0.10)
+    parser.add_argument('--task_limit', type=int, default=None)
     args = parser.parse_args()
     main(args)
