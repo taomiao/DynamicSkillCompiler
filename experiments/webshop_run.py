@@ -20,6 +20,7 @@ import traceback
 import multiprocessing
 
 from src.webshop.prompts.system_prompt import webshop_system_prompt
+from src.runtime_recompile import execute_compiled_procedure
 from src.skill import SkillModule
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +127,7 @@ def webshop_run_single(env, ob, instruction_text, max_steps=30, model=None, Skil
 
     use_skill = False
     if Skill_Module is not None:
+        Skill_Module.reset_runtime_recompile_state()
         relevant_skill_names = Skill_Module.retrieve_relevant_skills(ob)
         if relevant_skill_names:
             use_skill = True
@@ -136,32 +138,46 @@ def webshop_run_single(env, ob, instruction_text, max_steps=30, model=None, Skil
 
     # Execute Strategy
     if use_skill:
-        overall_procedure = Skill_Module.generate_overall_procedure(ob, relevant_skill_names)
-        print(f'\n{Colors.BLUE}Generated Overall Procedure:\n{overall_procedure}{Colors.RESET}')
-        
-        MAX_RETRIES = 3
-        retries = 0
-        
-        while retries < MAX_RETRIES:
-            try:
-                overall_procedure_code = Skill_Module.generate_overall_procedure_code(ob, overall_procedure)
-                print(f'\n{Colors.BLUE}Generated Overall Procedure Code:\n{overall_procedure_code}{Colors.RESET}')
+        def step_adapter(action, result):
+            observation, reward, done, info = result
+            return {
+                "action": action,
+                "observation": observation,
+                "task_done": done,
+                "task_reward": reward,
+            }
 
-                # Dynamic execution of generated procedure
-                namespace = {}
-                exec(overall_procedure_code, namespace)
-                func = namespace["overall_procedure_code"]
-                
-                messages, task_done, task_reward, steps = func(
-                    env, llm, model, parse_action, messages, max_steps
-                )
-                
-                if task_done:
-                    print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
-                break 
-            except Exception as e:
-                print(f'Error loading/executing procedure script: {e}')
-                retries += 1
+        def invoke(func, runtime_env, runtime_messages, remaining_steps):
+            return func(
+                runtime_env,
+                llm,
+                model,
+                parse_action,
+                runtime_messages,
+                remaining_steps,
+            )
+
+        execution = execute_compiled_procedure(
+            env=env,
+            llm=llm,
+            model=model,
+            task_prompt=ob,
+            messages=messages,
+            max_steps=max_steps,
+            skill_module=Skill_Module,
+            selected_skill_names=relevant_skill_names,
+            step_adapter=step_adapter,
+            invoke=invoke,
+        )
+        messages = execution["messages"]
+        task_done = execution["task_done"]
+        task_reward = execution["task_reward"]
+        steps = execution["steps"]
+        relevant_skill_names = execution["skill_names"]
+        overall_procedure = execution["overall_procedure"]
+        overall_procedure_code = execution["overall_procedure_code"]
+        if task_done:
+            print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
     else:
         messages, task_done, task_reward, steps = run_standard_procedure(
             env, llm, model, messages, max_steps
@@ -174,12 +190,33 @@ def webshop_run_single(env, ob, instruction_text, max_steps=30, model=None, Skil
         "steps": steps,
         "messages": messages,
         "relevant_skill_names": relevant_skill_names,
-        "skill_strategy": getattr(Skill_Module, "selection_strategy", "none") if Skill_Module else "none",
-        "compiler_metrics": (
-            Skill_Module.last_compilation.metrics.__dict__
-            if Skill_Module and Skill_Module.last_compilation is not None
-            else None
+        "runtime_recompile_count": (
+            Skill_Module.runtime_recompile_count if Skill_Module else 0
         ),
+        "runtime_recompile_events": (
+            Skill_Module.runtime_recompile_events if Skill_Module else []
+        ),
+        "skill_strategy": getattr(Skill_Module, "selection_strategy", "none") if Skill_Module else "none",
+    "compiler_metrics": (
+        Skill_Module.last_compilation.metrics.__dict__
+        if Skill_Module and Skill_Module.last_compilation is not None
+        else None
+    ),
+    "compiler_pass_traces": (
+        [
+            {
+                "pass_name": trace.pass_name,
+                "before_selected": trace.before_selected,
+                "after_selected": trace.after_selected,
+                "added": trace.added,
+                "removed": trace.removed,
+                "dropped_delta": trace.dropped_delta,
+            }
+            for trace in Skill_Module.last_compilation.pass_traces
+        ]
+        if Skill_Module and Skill_Module.last_compilation is not None
+        else None
+    ),
     })
     
     return results
@@ -214,6 +251,17 @@ def eval_single_game(game_idx, session_id, args, output_path):
                 "compiler_quality_weight": args.compiler_quality_weight,
                 "compiler_cost_weight": args.compiler_cost_weight,
                 "compiler_latency_weight": args.compiler_latency_weight,
+                "compiler_adaptive_workflow_bias": not args.compiler_disable_workflow_bias,
+                "compiler_graph_passes": args.compiler_graph_passes,
+                "compiler_critic_enabled": args.compiler_critic_enabled,
+                "compiler_critic_model": args.compiler_critic_model,
+                "compiler_critic_min_coverage": args.compiler_critic_min_coverage,
+                "compiler_critic_force": args.compiler_critic_force,
+                "runtime_recompile_enabled": args.runtime_recompile,
+                "runtime_recompile_max_rounds": args.runtime_recompile_max_rounds,
+                "runtime_recompile_min_interval_steps": args.runtime_recompile_min_interval_steps,
+                "runtime_recompile_stagnation_threshold": args.runtime_recompile_stagnation_threshold,
+                "runtime_recompile_min_remaining_steps": args.runtime_recompile_min_remaining_steps,
             }
             Skill_Module = SkillModule(**skill_config)
 
@@ -359,7 +407,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_steps', type=int, default=30)
     parser.add_argument('--exp_name', type=str, default='')
     parser.add_argument('--use_skill', action='store_true')
-    parser.add_argument('--skill_strategy', type=str, default='baseline', choices=['baseline', 'dsc'])
+    parser.add_argument('--skill_strategy', type=str, default='skillnet', choices=['baseline', 'skillnet', 'dsc'])
     parser.add_argument('--compiler_min_relevance', type=float, default=0.25)
     parser.add_argument('--compiler_preserve_top_k', type=int, default=2)
     parser.add_argument('--compiler_similar_prune_margin', type=float, default=0.08)
@@ -368,6 +416,17 @@ if __name__ == '__main__':
     parser.add_argument('--compiler_quality_weight', type=float, default=0.20)
     parser.add_argument('--compiler_cost_weight', type=float, default=0.15)
     parser.add_argument('--compiler_latency_weight', type=float, default=0.10)
+    parser.add_argument('--compiler_graph_passes', type=str, default='')
+    parser.add_argument('--compiler_disable_workflow_bias', action='store_true')
+    parser.add_argument('--compiler_critic_enabled', action='store_true')
+    parser.add_argument('--compiler_critic_model', type=str, default='')
+    parser.add_argument('--compiler_critic_min_coverage', type=float, default=0.45)
+    parser.add_argument('--compiler_critic_force', action='store_true')
+    parser.add_argument('--runtime_recompile', action='store_true')
+    parser.add_argument('--runtime_recompile_max_rounds', type=int, default=2)
+    parser.add_argument('--runtime_recompile_min_interval_steps', type=int, default=2)
+    parser.add_argument('--runtime_recompile_stagnation_threshold', type=int, default=2)
+    parser.add_argument('--runtime_recompile_min_remaining_steps', type=int, default=1)
     parser.add_argument('--task_limit', type=int, default=None)
     args = parser.parse_args()
     main(args)

@@ -29,7 +29,7 @@ class ExperimentSummaryTest(unittest.TestCase):
                         "steps": 20,
                         "task_done": False,
                         "relevant_skill_names": ["a", "b"],
-                        "skill_strategy": "baseline",
+                        "skill_strategy": "skillnet",
                     }
                 ),
                 encoding="utf-8",
@@ -63,6 +63,8 @@ class ExperimentSummaryTest(unittest.TestCase):
             summary = summarize_tree(root)
 
             self.assertEqual(len(summary["runs"]), 2)
+            skillnet_run = next(run for run in summary["runs"] if run["skill_mode"] == "skillnet")
+            self.assertEqual(skillnet_run["avg_selected_skill_names"], 2.0)
             dsc_run = next(run for run in summary["runs"] if run["skill_mode"] == "dsc")
             self.assertEqual(dsc_run["avg_compiler_selected_count"], 3.0)
             self.assertEqual(dsc_run["avg_compiler_token_reduction"], 5.0)

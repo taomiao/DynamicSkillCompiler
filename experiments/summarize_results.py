@@ -6,9 +6,10 @@ from typing import Dict, List, Optional
 
 def infer_skill_mode(run_name: str, sample: dict) -> str:
     if sample.get("skill_strategy"):
-        return str(sample["skill_strategy"])
+        mode = str(sample["skill_strategy"])
+        return "skillnet" if mode == "baseline" else mode
     if "_skill_True" in run_name:
-        return "baseline"
+        return "skillnet"
     if "_skill_False" in run_name:
         return "none"
     return "unknown"

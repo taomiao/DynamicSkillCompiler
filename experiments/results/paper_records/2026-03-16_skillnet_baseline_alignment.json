@@ -1,0 +1,58 @@
+{
+  "date": "2026-03-16",
+  "purpose": "Align experiment baseline naming with the paper's SkillNet setting.",
+  "strategy_alias": {
+    "canonical": "skillnet",
+    "compatibility_alias": "baseline"
+  },
+  "validation_run": {
+    "path": "/Users/taomiao/codes/DynamicSkillCompiler/SkillNet/experiments/results/scienceworld/o4-mini/dev_paper_align_skillnet_dev3_20260316_skill_skillnet",
+    "benchmark": "scienceworld",
+    "split": "dev",
+    "task_count": 3,
+    "model": "o4-mini",
+    "max_steps": 30,
+    "max_workers": 1,
+    "skill_strategy": "skillnet",
+    "success_count": 3,
+    "avg_reward": 44.0,
+    "avg_steps": 17.333333333333332,
+    "cases": [
+      {
+        "idx": 0,
+        "variation_idx": 418,
+        "task_done": true,
+        "reward": 24,
+        "steps": 25
+      },
+      {
+        "idx": 1,
+        "variation_idx": 186,
+        "task_done": true,
+        "reward": 100,
+        "steps": 15
+      },
+      {
+        "idx": 2,
+        "variation_idx": 326,
+        "task_done": true,
+        "reward": 8,
+        "steps": 12
+      }
+    ]
+  },
+  "full_reference_run": {
+    "path": "/Users/taomiao/codes/DynamicSkillCompiler/SkillNet/experiments/results/scienceworld/o4-mini/dev_formal_ab20_parallel_20260314_baseline_skill_baseline",
+    "benchmark": "scienceworld",
+    "split": "dev",
+    "task_count": 20,
+    "model": "o4-mini",
+    "max_steps": 30,
+    "max_workers": 4,
+    "recorded_strategy_label": "baseline",
+    "interpreted_strategy_label": "skillnet",
+    "success_count": 15,
+    "avg_reward": 64.15,
+    "avg_steps": 17.3
+  }
+}

@@ -80,15 +80,15 @@ Run the corresponding evaluation script from the `experiments/` directory.
 cd experiments
 
 # ALFWorld
-python alfworld_run.py --model o4-mini --split dev --max_workers 10 --exp_name alf_test --use_skill --skill_strategy baseline
+python alfworld_run.py --model o4-mini --split dev --max_workers 10 --exp_name alf_test --use_skill --skill_strategy skillnet
 python alfworld_run.py --model o4-mini --split dev --max_workers 10 --exp_name alf_test_dsc --use_skill --skill_strategy dsc
 
 # ScienceWorld
-python scienceworld_run.py --model o4-mini --split test --max_workers 5 --exp_name sci_test --use_skill --skill_strategy baseline
+python scienceworld_run.py --model o4-mini --split test --max_workers 5 --exp_name sci_test --use_skill --skill_strategy skillnet
 python scienceworld_run.py --model o4-mini --split test --max_workers 5 --exp_name sci_test_dsc --use_skill --skill_strategy dsc --compiler_min_relevance 0.15 --compiler_preserve_top_k 3
 
 # WebShop
-python webshop_run.py --model o4-mini --max_workers 3 --exp_name web_test --use_skill --skill_strategy baseline
+python webshop_run.py --model o4-mini --max_workers 3 --exp_name web_test --use_skill --skill_strategy skillnet
 python webshop_run.py --model o4-mini --max_workers 3 --exp_name web_test_dsc --use_skill --skill_strategy dsc
 ```
 
@@ -103,7 +103,7 @@ python webshop_run.py --model o4-mini --max_workers 3 --exp_name web_test_dsc --
 
 - `--use_skill`: Enable the skill-augmented module.
 
-- `--skill_strategy`: `baseline` uses the original skill retrieval path, `dsc` enables Dynamic Skill Compiler.
+- `--skill_strategy`: `skillnet` runs the paper-aligned SkillNet retrieval baseline, `dsc` enables Dynamic Skill Compiler. `baseline` is kept as a compatibility alias for `skillnet`.
 
 - `--compiler_min_relevance`: pruning threshold for DSC.
 

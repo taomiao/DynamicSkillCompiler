@@ -8,6 +8,7 @@ import argparse
 import time
 import importlib.util
 from pathlib import Path
+from typing import Optional
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 scienceworld_candidates = [
@@ -21,6 +22,7 @@ if scienceworld_path not in sys.path:
 from scienceworld import ScienceWorldEnv
 
 from src.scienceworld.prompts.system_prompt import scienceworld_system_prompt
+from src.runtime_recompile import execute_compiled_procedure
 from src.skill import SkillModule
 from src.utils import chat_completion
 
@@ -61,6 +63,10 @@ class Colors:
 
 def _normalize_action_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+def _strip_leading_articles(text: str) -> str:
+    return re.sub(r"^(?:the|a|an)\s+", "", text.strip(), flags=re.IGNORECASE)
 
 
 def _strip_instance_details(text: str) -> str:
@@ -131,6 +137,64 @@ def _normalize_indexed_object_guess(action: str, last_observation: str) -> str:
     return action
 
 
+def _normalize_scienceworld_action(action: str) -> str:
+    normalized = re.sub(r"\s+", " ", action or "").strip().strip(".")
+    if not normalized:
+        return ""
+
+    def clean_object(text: str, drop_suffix: Optional[str] = None) -> str:
+        value = _strip_leading_articles(text)
+        if drop_suffix:
+            value = re.sub(rf"\s+{drop_suffix}$", "", value, flags=re.IGNORECASE)
+        return value.strip()
+
+    exact_aliases = {
+        "look": "look around",
+        "wait 1": "wait1",
+        "wait one step": "wait1",
+    }
+    lowered = _normalize_action_text(normalized)
+    if lowered in exact_aliases:
+        return exact_aliases[lowered]
+
+    alias_patterns = [
+        (r"^(?:teleport(?: to)?)\s+(.+)$", lambda match: f"teleport to {clean_object(match.group(1))}"),
+        (r"^(?:focus)\s+(.+)$", lambda match: f"focus on {clean_object(match.group(1))}"),
+        (r"^(?:inspect|check)\s+(.+)$", lambda match: f"examine {clean_object(match.group(1))}"),
+        (r"^(?:turn on|switch on|power on|start)\s+(.+)$", lambda match: f"activate {clean_object(match.group(1))}"),
+        (r"^(?:turn off|switch off|power off|stop)\s+(.+)$", lambda match: f"deactivate {clean_object(match.group(1))}"),
+        (r"^(open|close)\s+(.+?)\s+(?:door|lid)$", lambda match: f"{match.group(1).lower()} {clean_object(match.group(2))}"),
+        (r"^(?:take|grab|get)\s+(.+?)(?:\s+from\s+.+)?$", lambda match: f"pick up {clean_object(match.group(1))}"),
+        (r"^(?:pick up)\s+(.+?)(?:\s+from\s+.+)?$", lambda match: f"pick up {clean_object(match.group(1))}"),
+        (r"^(?:pick)\s+(.+?)\s+up(?:\s+from\s+.+)?$", lambda match: f"pick up {clean_object(match.group(1))}"),
+        (r"^(?:put|place|move)\s+(.+?)\s+(?:in|into|on|onto|to)\s+(.+)$", lambda match: f"move {clean_object(match.group(1))} to {clean_object(match.group(2))}"),
+        (r"^(?:connect)\s+(.+?)\s+(?:with|and)\s+(.+)$", lambda match: f"connect {clean_object(match.group(1))} to {clean_object(match.group(2))}"),
+    ]
+
+    for pattern, replacer in alias_patterns:
+        match = re.match(pattern, normalized, re.IGNORECASE)
+        if match:
+            return replacer(match)
+
+    direct_patterns = [
+        (r"^(open|close|activate|deactivate|disconnect|examine|look at|read|pick up|focus on|mix)\s+(.+)$", lambda match: f"{match.group(1).lower()} {clean_object(match.group(2))}"),
+        (r"^(move)\s+(.+?)\s+to\s+(.+)$", lambda match: f"move {clean_object(match.group(2))} to {clean_object(match.group(3))}"),
+        (r"^(connect)\s+(.+?)\s+to\s+(.+)$", lambda match: f"connect {clean_object(match.group(2))} to {clean_object(match.group(3))}"),
+        (r"^(pour)\s+(.+?)\s+into\s+(.+)$", lambda match: f"pour {clean_object(match.group(2))} into {clean_object(match.group(3))}"),
+        (r"^(use)\s+(.+?)\s+on\s+(.+)$", lambda match: f"use {clean_object(match.group(2))} on {clean_object(match.group(3))}"),
+        (r"^(use)\s+(.+)$", lambda match: f"use {clean_object(match.group(2))}"),
+        (r"^(teleport to)\s+(.+)$", lambda match: f"teleport to {clean_object(match.group(2))}"),
+        (r"^(wait1?)$", lambda match: match.group(1).lower()),
+    ]
+
+    for pattern, replacer in direct_patterns:
+        match = re.match(pattern, normalized, re.IGNORECASE)
+        if match:
+            return replacer(match)
+
+    return normalized
+
+
 def parse_action(response: str, last_observation: str = "") -> str:
     """
     Extract an executable action and map ambiguous-choice follow-ups back to the required index.
@@ -142,6 +206,7 @@ def parse_action(response: str, last_observation: str = "") -> str:
     else:
         stripped = response.strip().strip('"\'*`')
         action = stripped if re.fullmatch(r"\d+", stripped) else ""
+    action = _normalize_scienceworld_action(action)
     action = _normalize_indexed_object_guess(action, last_observation)
     return _resolve_ambiguous_action(action, last_observation)
 
@@ -270,6 +335,7 @@ def scienceworld_run_single(env, task_name, var_idx, args, Skill_Module=None, pr
 
     use_skill = False
     if Skill_Module is not None:
+        Skill_Module.reset_runtime_recompile_state()
         if progress_callback:
             progress_callback("retrieving_skills")
         ensure_task_not_timed_out()
@@ -281,48 +347,52 @@ def scienceworld_run_single(env, task_name, var_idx, args, Skill_Module=None, pr
             progress_callback("skills_retrieved", {"relevant_skill_names": relevant_skill_names})
     
     if use_skill:
-        if progress_callback:
-            progress_callback("generating_procedure")
         ensure_task_not_timed_out()
-        overall_procedure = Skill_Module.generate_overall_procedure(query, relevant_skill_names)
-        print(f'\n{Colors.BLUE}Generated Overall Procedure:\n{overall_procedure}{Colors.RESET}')
-        if progress_callback:
-            progress_callback("procedure_generated")
+        def step_adapter(action, result):
+            observation, step_reward, task_done_flag, info = result
+            reward = info.get("score") if isinstance(info, dict) else None
+            if reward is None:
+                reward = step_reward
+            return {
+                "action": action,
+                "observation": observation,
+                "task_done": task_done_flag,
+                "task_reward": reward,
+            }
 
-        MAX_RETRIES = 3
-        retries = 0
-        while retries < MAX_RETRIES:
-            try:
-                if progress_callback:
-                    progress_callback("generating_procedure_code", {"retry": retries})
-                ensure_task_not_timed_out()
-                overall_procedure_code = Skill_Module.generate_overall_procedure_code(query, overall_procedure)
-                print(f'\n{Colors.BLUE}Generated Procedure Code:\n{overall_procedure_code}{Colors.RESET}')
-                if progress_callback:
-                    progress_callback("procedure_code_generated")
+        def invoke(func, runtime_env, runtime_messages, remaining_steps):
+            ensure_task_not_timed_out()
+            return func(
+                runtime_env,
+                llm,
+                args.model,
+                parse_action,
+                runtime_messages,
+                remaining_steps,
+            )
 
-                namespace = {}
-                exec(overall_procedure_code, namespace)
-                func = namespace.get("overall_procedure_code")
-                
-                if func:
-                    if progress_callback:
-                        progress_callback("executing_procedure")
-                    ensure_task_not_timed_out()
-                    messages, task_done, task_reward, steps = func(
-                        env, llm, args.model, parse_action, messages, args.max_steps
-                    )
-                else:
-                    raise ValueError("Function 'overall_procedure_code' not found in generated code.")
-                
-                if task_done:
-                    print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
-                    break 
-            except Exception as e:
-                print(f'Error loading/executing procedure script: {e}')
-                if progress_callback:
-                    progress_callback("procedure_retry", {"retry": retries, "error": str(e)})
-                retries += 1
+        execution = execute_compiled_procedure(
+            env=env,
+            llm=llm,
+            model=args.model,
+            task_prompt=query,
+            messages=messages,
+            max_steps=args.max_steps,
+            skill_module=Skill_Module,
+            selected_skill_names=relevant_skill_names,
+            step_adapter=step_adapter,
+            invoke=invoke,
+            progress_callback=progress_callback,
+        )
+        messages = execution["messages"]
+        task_done = execution["task_done"]
+        task_reward = execution["task_reward"]
+        steps = execution["steps"]
+        relevant_skill_names = execution["skill_names"]
+        overall_procedure = execution["overall_procedure"]
+        overall_procedure_code = execution["overall_procedure_code"]
+        if task_done:
+            print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
     else:
         if progress_callback:
             progress_callback("running_standard_procedure")
@@ -350,11 +420,52 @@ def scienceworld_run_single(env, task_name, var_idx, args, Skill_Module=None, pr
         "steps": steps,
         "messages": messages,
         "relevant_skill_names": relevant_skill_names,
+        "runtime_recompile_count": (
+            Skill_Module.runtime_recompile_count if Skill_Module else 0
+        ),
+        "runtime_recompile_events": (
+            Skill_Module.runtime_recompile_events if Skill_Module else []
+        ),
         "skill_strategy": getattr(Skill_Module, "selection_strategy", "none") if Skill_Module else "none",
         "compiler_metrics": (
             Skill_Module.last_compilation.metrics.__dict__
             if Skill_Module and Skill_Module.last_compilation is not None
             else None
+        ),
+        "compiler_pass_traces": (
+            [
+                {
+                    "pass_name": trace.pass_name,
+                    "before_selected": trace.before_selected,
+                    "after_selected": trace.after_selected,
+                    "added": trace.added,
+                    "removed": trace.removed,
+                    "dropped_delta": trace.dropped_delta,
+                }
+                for trace in Skill_Module.last_compilation.pass_traces
+            ]
+            if Skill_Module and Skill_Module.last_compilation is not None
+            else None
+        ),
+        "payload_strategy": (
+            Skill_Module.last_payload_strategy
+            if Skill_Module is not None
+            else "full"
+        ),
+        "compiler_notes": (
+            list(Skill_Module.last_compilation.notes)
+            if Skill_Module and Skill_Module.last_compilation is not None
+            else []
+        ),
+        "seed_skill_names": (
+            list(Skill_Module.last_seed_skill_names)
+            if Skill_Module is not None
+            else []
+        ),
+        "quality_reference_skill_names": (
+            list(Skill_Module.last_quality_reference_skill_names)
+            if Skill_Module is not None
+            else []
         ),
     }
 
@@ -412,6 +523,17 @@ def eval_single_variation(idx, indices, args, output_path):
                 "compiler_quality_weight": args.compiler_quality_weight,
                 "compiler_cost_weight": args.compiler_cost_weight,
                 "compiler_latency_weight": args.compiler_latency_weight,
+                "compiler_adaptive_workflow_bias": not args.compiler_disable_workflow_bias,
+                "compiler_graph_passes": args.compiler_graph_passes,
+                "compiler_critic_enabled": args.compiler_critic_enabled,
+                "compiler_critic_model": args.compiler_critic_model,
+                "compiler_critic_min_coverage": args.compiler_critic_min_coverage,
+                "compiler_critic_force": args.compiler_critic_force,
+                "runtime_recompile_enabled": args.runtime_recompile,
+                "runtime_recompile_max_rounds": args.runtime_recompile_max_rounds,
+                "runtime_recompile_min_interval_steps": args.runtime_recompile_min_interval_steps,
+                "runtime_recompile_stagnation_threshold": args.runtime_recompile_stagnation_threshold,
+                "runtime_recompile_min_remaining_steps": args.runtime_recompile_min_remaining_steps,
             }
             Skill_Module = SkillModule(**skill_config)
             progress_callback("skill_module_ready")
@@ -446,6 +568,16 @@ def eval_single_variation(idx, indices, args, output_path):
             "relevant_skill_names": task_state["relevant_skill_names"],
             "skill_strategy": args.skill_strategy if args.use_skill else "none",
             "compiler_metrics": None,
+            "payload_strategy": (
+                Skill_Module.last_payload_strategy
+                if args.use_skill and Skill_Module is not None
+                else "full"
+            ),
+            "compiler_notes": (
+                list(Skill_Module.last_retrieval_warnings)
+                if args.use_skill and Skill_Module is not None
+                else []
+            ),
             "last_stage": task_state["stage"],
             "error": str(e),
         }
@@ -584,7 +716,7 @@ def build_arg_parser():
     parser.add_argument('--max_steps', type=int, default=30)
     parser.add_argument('--exp_name', type=str, default='')
     parser.add_argument('--use_skill', action='store_true')
-    parser.add_argument('--skill_strategy', type=str, default='baseline', choices=['baseline', 'dsc'])
+    parser.add_argument('--skill_strategy', type=str, default='skillnet', choices=['baseline', 'skillnet', 'dsc'])
     parser.add_argument('--compiler_min_relevance', type=float, default=0.25)
     parser.add_argument('--compiler_preserve_top_k', type=int, default=2)
     parser.add_argument('--compiler_similar_prune_margin', type=float, default=0.08)
@@ -593,6 +725,17 @@ def build_arg_parser():
     parser.add_argument('--compiler_quality_weight', type=float, default=0.20)
     parser.add_argument('--compiler_cost_weight', type=float, default=0.15)
     parser.add_argument('--compiler_latency_weight', type=float, default=0.10)
+    parser.add_argument('--compiler_graph_passes', type=str, default='')
+    parser.add_argument('--compiler_disable_workflow_bias', action='store_true')
+    parser.add_argument('--compiler_critic_enabled', action='store_true')
+    parser.add_argument('--compiler_critic_model', type=str, default='')
+    parser.add_argument('--compiler_critic_min_coverage', type=float, default=0.45)
+    parser.add_argument('--compiler_critic_force', action='store_true')
+    parser.add_argument('--runtime_recompile', action='store_true')
+    parser.add_argument('--runtime_recompile_max_rounds', type=int, default=2)
+    parser.add_argument('--runtime_recompile_min_interval_steps', type=int, default=2)
+    parser.add_argument('--runtime_recompile_stagnation_threshold', type=int, default=2)
+    parser.add_argument('--runtime_recompile_min_remaining_steps', type=int, default=1)
     parser.add_argument('--task_limit', type=int, default=None)
     parser.add_argument('--llm_timeout', type=float, default=90.0)
     parser.add_argument('--llm_retry_attempts', type=int, default=3)
@@ -611,9 +754,13 @@ def _run_as_imported_module(args):
     # Script-mode execution under Python.app was observed to hang inside the
     # ScienceWorld runner before task progress advanced. Reloading the file as a
     # named module matches the imported execution path, which runs reliably.
-    spec = importlib.util.spec_from_file_location("scienceworld_run_cli", __file__)
+    # Use the real module name so ProcessPoolExecutor workers can import it.
+    spec = importlib.util.spec_from_file_location("scienceworld_run", __file__)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    # Register the module before execution so worker processes can import and
+    # pickle top-level callables from this file by module name.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     module.main(args)
 
