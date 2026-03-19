@@ -429,6 +429,17 @@ class SkillNetClient:
                 for relation in compiled.graph.relations
             ],
             "metrics": compiled.metrics.__dict__,
+            "pass_traces": [
+                {
+                    "pass_name": trace.pass_name,
+                    "before_selected": trace.before_selected,
+                    "after_selected": trace.after_selected,
+                    "added": trace.added,
+                    "removed": trace.removed,
+                    "dropped_delta": trace.dropped_delta,
+                }
+                for trace in compiled.pass_traces
+            ],
             "dropped_skills": compiled.dropped_skills,
             "notes": compiled.notes,
         }

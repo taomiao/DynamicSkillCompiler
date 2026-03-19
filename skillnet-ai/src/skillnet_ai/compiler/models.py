@@ -153,6 +153,16 @@ class CompilationMetrics:
 
 
 @dataclass
+class CompilerPassTrace:
+    pass_name: str
+    before_selected: List[str] = field(default_factory=list)
+    after_selected: List[str] = field(default_factory=list)
+    added: List[str] = field(default_factory=list)
+    removed: List[str] = field(default_factory=list)
+    dropped_delta: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class CompiledSkillPackage:
     query_plan: QueryPlan
     subgoals: List[Subgoal]
@@ -162,3 +172,4 @@ class CompiledSkillPackage:
     metrics: CompilationMetrics
     dropped_skills: Dict[str, str]
     notes: List[str] = field(default_factory=list)
+    pass_traces: List[CompilerPassTrace] = field(default_factory=list)

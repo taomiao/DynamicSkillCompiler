@@ -31,6 +31,9 @@ webshop_path = next((path for path in webshop_candidates if os.path.isdir(path))
 if webshop_path not in sys.path:
     sys.path.append(webshop_path)
 from web_agent_site.envs import WebAgentTextEnv
+from web_agent_site.engine.engine import load_products
+from web_agent_site.engine.goal import get_goals
+from web_agent_site.utils import DEFAULT_FILE_PATH
 
 
 client = None
@@ -44,6 +47,25 @@ def get_client():
             base_url=os.environ["BASE_URL"]
         )
     return client
+
+
+def filter_valid_session_ids(session_ids, num_products=None):
+    if num_products is None:
+        return session_ids
+
+    all_products, _, product_prices, _ = load_products(
+        filepath=DEFAULT_FILE_PATH,
+        num_products=num_products,
+        human_goals=False,
+    )
+    max_goal_idx = len(get_goals(all_products, product_prices, human_goals=False))
+    valid_session_ids = [sid for sid in session_ids if isinstance(sid, int) and 0 <= sid < max_goal_idx]
+    invalid_count = len(session_ids) - len(valid_session_ids)
+    print(
+        f"Filtered invalid WebShop sessions for num_products={num_products}: "
+        f"kept {len(valid_session_ids)}, dropped {invalid_count}, goal_count={max_goal_idx}"
+    )
+    return valid_session_ids
 
 @retry(tries=5, delay=5, backoff=2, jitter=(1, 3))
 def llm(prompt, model="YOUR_MODEL_NAME"):
@@ -189,7 +211,12 @@ def eval_single_game(game_idx, session_id, args, output_path):
         # WebShop environment setup
         port = 3500 + game_idx
         base_url = 'http://127.0.0.1:' + str(port)
-        env = gym.make('WebAgentTextEnv-v0', observation_mode='text', num_products=None, base_url=base_url)
+        env = gym.make(
+            'WebAgentTextEnv-v0',
+            observation_mode='text',
+            num_products=args.num_products,
+            base_url=base_url,
+        )
         print(f'{Colors.BLUE}Initialized WebShop environment for game {game_idx} at port {port}{Colors.RESET}')
         ob = env.reset(session=session_id)[0] 
 
@@ -258,6 +285,8 @@ def main(args):
 
     with open('src/webshop/data/test_indices.json', 'r') as f:
         session_ids = json.load(f)
+    if args.filter_invalid_sessions:
+        session_ids = filter_valid_session_ids(session_ids, num_products=args.num_products)
 
     # ---------------------------------------------------------
     # Identify Remaining Tasks (Checkpointing)
@@ -368,6 +397,8 @@ if __name__ == '__main__':
     parser.add_argument('--compiler_quality_weight', type=float, default=0.20)
     parser.add_argument('--compiler_cost_weight', type=float, default=0.15)
     parser.add_argument('--compiler_latency_weight', type=float, default=0.10)
+    parser.add_argument('--num_products', type=int, default=None)
     parser.add_argument('--task_limit', type=int, default=None)
+    parser.add_argument('--filter_invalid_sessions', action='store_true')
     args = parser.parse_args()
     main(args)

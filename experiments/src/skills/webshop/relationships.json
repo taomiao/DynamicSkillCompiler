@@ -1,0 +1,224 @@
+[
+  {
+    "source": "webshop-query-interpreter",
+    "target": "webshop-query-parser",
+    "type": "similar_to",
+    "reason": "Both convert a natural-language shopping request into structured product constraints for downstream search."
+  },
+  {
+    "source": "webshop-query-parser",
+    "target": "webshop-search-formulator",
+    "type": "compose_with",
+    "reason": "The parser extracts structured constraints that the search formulator turns into practical search keywords."
+  },
+  {
+    "source": "webshop-query-interpreter",
+    "target": "webshop-search-constructor",
+    "type": "compose_with",
+    "reason": "The interpreter identifies requirements that the search constructor uses to build a concrete search action string."
+  },
+  {
+    "source": "webshop-search-formulator",
+    "target": "webshop-search-constructor",
+    "type": "similar_to",
+    "reason": "Both synthesize search text from structured criteria, differing mainly in output format and prompt style."
+  },
+  {
+    "source": "webshop-search-executor",
+    "target": "webshop-search-formulator",
+    "type": "depend_on",
+    "reason": "Executing a search requires a usable keyword query from the formulator."
+  },
+  {
+    "source": "webshop-search-executor",
+    "target": "webshop-action-executor",
+    "type": "depend_on",
+    "reason": "Search execution ultimately issues a formatted interface action through the generic action executor."
+  },
+  {
+    "source": "webshop-product-search",
+    "target": "webshop-search-executor",
+    "type": "depend_on",
+    "reason": "Product search relies on the lower-level executor to submit the search action and fetch results."
+  },
+  {
+    "source": "webshop-initial-search",
+    "target": "webshop-product-search",
+    "type": "belong_to",
+    "reason": "Initial search is a narrower first-pass version of the broader product-search skill."
+  },
+  {
+    "source": "webshop-initial-search",
+    "target": "webshop-search-constructor",
+    "type": "depend_on",
+    "reason": "Initial search needs a compact, platform-ready search string before submitting the first query."
+  },
+  {
+    "source": "webshop-product-search",
+    "target": "webshop-result-analyzer",
+    "type": "compose_with",
+    "reason": "After retrieving search results, the analyzer helps interpret which listings are worth pursuing."
+  },
+  {
+    "source": "webshop-result-analyzer",
+    "target": "webshop-product-evaluator",
+    "type": "similar_to",
+    "reason": "Both review result listings against user constraints to identify promising candidate products."
+  },
+  {
+    "source": "webshop-result-filter",
+    "target": "webshop-result-analyzer",
+    "type": "similar_to",
+    "reason": "Both narrow a search results page to items that best satisfy the target attributes and constraints."
+  },
+  {
+    "source": "webshop-product-selector",
+    "target": "webshop-result-analyzer",
+    "type": "depend_on",
+    "reason": "Selecting the best product candidate assumes a prior shortlist or ranking from result analysis."
+  },
+  {
+    "source": "webshop-result-filter",
+    "target": "webshop-product-selector",
+    "type": "compose_with",
+    "reason": "Filtering reduces the candidate pool that the product selector then chooses from."
+  },
+  {
+    "source": "webshop-result-page-navigator",
+    "target": "webshop-result-filter",
+    "type": "compose_with",
+    "reason": "Pagination is typically triggered after filtering shows that the current results page lacks a viable match."
+  },
+  {
+    "source": "webshop-result-page-navigator",
+    "target": "webshop-action-executor",
+    "type": "depend_on",
+    "reason": "Moving between result pages requires issuing a concrete click action through the action executor."
+  },
+  {
+    "source": "webshop-product-selector",
+    "target": "webshop-product-detail-navigator",
+    "type": "compose_with",
+    "reason": "After a product is selected from results, the next step is to navigate into its detail page."
+  },
+  {
+    "source": "webshop-product-detail-navigator",
+    "target": "webshop-action-executor",
+    "type": "depend_on",
+    "reason": "Opening a product detail page requires executing a specific click action."
+  },
+  {
+    "source": "webshop-product-detail-navigator",
+    "target": "webshop-product-detail-check",
+    "type": "compose_with",
+    "reason": "Detail navigation is usually followed by a broader validation pass over the loaded product page."
+  },
+  {
+    "source": "webshop-product-detail-navigator",
+    "target": "webshop-product-detail-inspector",
+    "type": "compose_with",
+    "reason": "Once the detail page is open, the inspector can verify fine-grained fields and selectable options."
+  },
+  {
+    "source": "webshop-product-detail-check",
+    "target": "webshop-product-detail-inspector",
+    "type": "similar_to",
+    "reason": "Both inspect a product detail page for requirement match, with the inspector being slightly more interaction-oriented."
+  },
+  {
+    "source": "webshop-attribute-verifier",
+    "target": "webshop-product-detail-check",
+    "type": "belong_to",
+    "reason": "Attribute verification is a focused subset of the broader product detail checking workflow."
+  },
+  {
+    "source": "webshop-price-checker",
+    "target": "webshop-product-detail-check",
+    "type": "compose_with",
+    "reason": "A detail check often includes an explicit budget validation step using the price checker."
+  },
+  {
+    "source": "webshop-product-detail-inspector",
+    "target": "webshop-option-selector",
+    "type": "compose_with",
+    "reason": "Inspection of the detail page naturally feeds into selecting the correct option or variant."
+  },
+  {
+    "source": "webshop-option-selector",
+    "target": "webshop-attribute-verifier",
+    "type": "compose_with",
+    "reason": "After choosing an option, attribute verification confirms the page now reflects the desired configuration."
+  },
+  {
+    "source": "webshop-attribute-selector",
+    "target": "webshop-option-selector",
+    "type": "belong_to",
+    "reason": "Attribute selection is a more specific case of the broader option-selection capability."
+  },
+  {
+    "source": "webshop-variant-chooser",
+    "target": "webshop-option-selector",
+    "type": "belong_to",
+    "reason": "Variant choosing is a narrower specialization of option selection on product detail pages."
+  },
+  {
+    "source": "webshop-attribute-selector",
+    "target": "webshop-variant-chooser",
+    "type": "similar_to",
+    "reason": "Both skills specialize in selecting detail-page variants such as size, color, quantity, or flavor."
+  },
+  {
+    "source": "webshop-option-selector",
+    "target": "webshop-action-executor",
+    "type": "depend_on",
+    "reason": "Selecting an option requires issuing a click action through the generic action executor."
+  },
+  {
+    "source": "webshop-attribute-selector",
+    "target": "webshop-action-executor",
+    "type": "depend_on",
+    "reason": "Attribute selection is realized as a concrete click action on the page."
+  },
+  {
+    "source": "webshop-variant-chooser",
+    "target": "webshop-action-executor",
+    "type": "depend_on",
+    "reason": "Variant choice must be applied through a concrete page interaction."
+  },
+  {
+    "source": "webshop-purchase-initiator",
+    "target": "webshop-purchase-executor",
+    "type": "similar_to",
+    "reason": "Both culminate in triggering the final buy action once the product is confirmed."
+  },
+  {
+    "source": "webshop-product-detail-check",
+    "target": "webshop-purchase-initiator",
+    "type": "compose_with",
+    "reason": "Once the detail page has been validated, the purchase initiator carries the workflow into checkout."
+  },
+  {
+    "source": "webshop-purchase-initiator",
+    "target": "webshop-attribute-verifier",
+    "type": "compose_with",
+    "reason": "Purchase initiation is usually preceded by a final verification that the selected attributes match the request."
+  },
+  {
+    "source": "webshop-purchase-initiator",
+    "target": "webshop-price-checker",
+    "type": "compose_with",
+    "reason": "The initiator often depends on a last budget confirmation before clicking the buy button."
+  },
+  {
+    "source": "webshop-purchase-executor",
+    "target": "webshop-action-executor",
+    "type": "depend_on",
+    "reason": "Completing the purchase requires a final click action through the generic action executor."
+  },
+  {
+    "source": "webshop-purchase-initiator",
+    "target": "webshop-action-executor",
+    "type": "depend_on",
+    "reason": "Initiating checkout ultimately uses the same click-action primitive as other UI interaction skills."
+  }
+]

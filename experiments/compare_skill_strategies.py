@@ -82,6 +82,10 @@ def make_module(case: dict, strategy: str, args) -> SkillModule:
         compiler_cost_weight=args.compiler_cost_weight,
         compiler_latency_weight=args.compiler_latency_weight,
         compiler_top_k=args.compiler_top_k,
+        compiler_critic_enabled=args.compiler_critic_enabled,
+        compiler_critic_model=args.compiler_critic_model,
+        compiler_critic_min_coverage=args.compiler_critic_min_coverage,
+        compiler_critic_force=args.compiler_critic_force,
     )
 
 
@@ -161,6 +165,10 @@ def main():
     parser.add_argument("--compiler_cost_weight", type=float, default=0.10)
     parser.add_argument("--compiler_latency_weight", type=float, default=0.05)
     parser.add_argument("--compiler_top_k", type=int, default=6)
+    parser.add_argument("--compiler_critic_enabled", action="store_true")
+    parser.add_argument("--compiler_critic_model", default="")
+    parser.add_argument("--compiler_critic_min_coverage", type=float, default=0.45)
+    parser.add_argument("--compiler_critic_force", action="store_true")
     args = parser.parse_args()
 
     cases = DEFAULT_CASES

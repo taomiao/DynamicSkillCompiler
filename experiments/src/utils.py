@@ -1,5 +1,6 @@
 import os
 import time
+import re
 from openai import OpenAI
 import json
 _CLIENT = None
@@ -72,3 +73,29 @@ def get_llm_response(messages, is_string=False, model="gpt-4o"):
             return ans
     else:
         raise Exception(response.error.message)
+
+
+def strip_code_fences(text):
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned, count=1)
+        cleaned = re.sub(r"\s*```$", "", cleaned, count=1)
+    return cleaned.strip()
+
+
+def extract_tagged_text(text, tag):
+    pattern = rf"<{tag}>\s*(.*?)\s*</{tag}>"
+    matches = re.findall(pattern, text or "", flags=re.DOTALL | re.IGNORECASE)
+    if not matches:
+        return ""
+    return strip_code_fences(matches[-1])
+
+
+def extract_tagged_json(text, tag, default=None):
+    content = extract_tagged_text(text, tag)
+    if not content:
+        return [] if default is None else default
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        return [] if default is None else default

@@ -10,12 +10,21 @@ from skillnet_ai.compiler.models import SkillAsset, SkillFragment, Subgoal
 LINE_SPLIT = re.compile(r"[.\n]")
 ACTION_QUOTED = re.compile(r"`([^`]+)`")
 ACTION_PREFIXES = (
+    "teleport to ",
+    "pick up ",
     "go to ",
     "take ",
     "move ",
     "open ",
     "close ",
     "use ",
+    "look at ",
+    "examine ",
+    "turn on ",
+    "turn off ",
+    "deactivate ",
+    "wait1",
+    "wait",
     "clean ",
     "heat ",
     "cool ",
@@ -32,6 +41,14 @@ ACTION_PREFIXES = (
     "filter ",
     "sort ",
 )
+LOW_SIGNAL_PREFIXES = (
+    "purpose",
+    "when to use",
+    "notes",
+    "key parameters",
+    "key considerations",
+    "integration with other skills",
+)
 
 
 @dataclass
@@ -46,17 +63,21 @@ class SkillFragmentExtractor:
         return fragment_map
 
     def _extract_for_skill(self, skill: SkillAsset) -> List[SkillFragment]:
-        lines: List[str] = []
+        indexed_lines: List[tuple[int, str]] = []
         for instruction in skill.instructions:
             for line in LINE_SPLIT.split(instruction):
                 cleaned = line.strip(" -*\t")
                 if cleaned:
-                    lines.append(cleaned)
+                    indexed_lines.append((len(indexed_lines), cleaned))
+        lines = [line for _, line in indexed_lines]
         if not lines:
             lines.append(skill.description)
+            indexed_lines = [(0, skill.description)]
+
+        selected_lines = self._select_fragment_lines(indexed_lines)
 
         fragments: List[SkillFragment] = []
-        for index, line in enumerate(lines[: self.max_fragments_per_skill]):
+        for index, line in enumerate(selected_lines):
             capabilities = {
                 token.strip(".,:;()[]{}").lower()
                 for token in line.split()
@@ -83,13 +104,51 @@ class SkillFragmentExtractor:
             )
         return fragments
 
+    def _select_fragment_lines(self, indexed_lines: List[tuple[int, str]]) -> List[str]:
+        if len(indexed_lines) <= self.max_fragments_per_skill:
+            return [line for _, line in indexed_lines]
+
+        ranked = sorted(
+            indexed_lines,
+            key=lambda item: (
+                self._line_priority(item[1]),
+                -item[0],
+            ),
+            reverse=True,
+        )
+        chosen = sorted(
+            ranked[: self.max_fragments_per_skill],
+            key=lambda item: item[0],
+        )
+        return [line for _, line in chosen]
+
+    def _line_priority(self, line: str) -> int:
+        lowered = line.lower()
+        priority = 0
+        if self._extract_actions(line):
+            priority += 8
+        if self._extract_preconditions(line):
+            priority += 3
+        if self._extract_postconditions(line):
+            priority += 2
+        if any(marker in lowered for marker in ("command", "action pattern", "execute", "retry", "verify")):
+            priority += 2
+        if any(lowered.startswith(prefix) for prefix in LOW_SIGNAL_PREFIXES):
+            priority -= 2
+        return priority
+
     def _extract_actions(self, line: str) -> List[str]:
         matches = ACTION_QUOTED.findall(line)
         if matches:
             return matches
-        if "action:" in line.lower():
-            return [line.split(":", 1)[1].strip()]
         lowered = line.lower()
+        for marker in ("action:", "command:", "action pattern:", "example:"):
+            if marker in lowered:
+                candidate = line[lowered.find(marker) + len(marker):].strip()
+                if candidate:
+                    return [candidate]
+        if "action:" in lowered:
+            return [line.split(":", 1)[1].strip()]
         for prefix in ACTION_PREFIXES:
             idx = lowered.find(prefix)
             if idx != -1:

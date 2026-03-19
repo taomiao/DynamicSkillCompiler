@@ -1,0 +1,278 @@
+[
+  {
+    "source": "alfworld-goal-interpreter",
+    "target": "alfworld-environment-scanner",
+    "type": "compose_with",
+    "reason": "Task interpretation is typically followed by an environment scan so the agent can ground the parsed subgoals in visible objects and receptacles."
+  },
+  {
+    "source": "alfworld-goal-interpreter",
+    "target": "alfworld-navigation-planner",
+    "type": "compose_with",
+    "reason": "The interpreted goal provides the destinations and search priorities that the navigation planner turns into movement decisions."
+  },
+  {
+    "source": "alfworld-navigation-planner",
+    "target": "alfworld-location-navigator",
+    "type": "compose_with",
+    "reason": "The planner decides where to go next, and the location navigator executes that movement."
+  },
+  {
+    "source": "alfworld-receptacle-navigator",
+    "target": "alfworld-location-navigator",
+    "type": "belong_to",
+    "reason": "Receptacle navigation is a specific case of the broader location-navigation capability."
+  },
+  {
+    "source": "alfworld-appliance-navigator",
+    "target": "alfworld-location-navigator",
+    "type": "belong_to",
+    "reason": "Appliance navigation is a specialized form of moving to a target location."
+  },
+  {
+    "source": "alfworld-search-pattern-executor",
+    "target": "alfworld-navigation-planner",
+    "type": "depend_on",
+    "reason": "Systematic search execution relies on a planner to sequence candidate locations and traverse them efficiently."
+  },
+  {
+    "source": "alfworld-search-verifier",
+    "target": "alfworld-search-pattern-executor",
+    "type": "compose_with",
+    "reason": "Search verification usually follows an initial systematic search to double-check missed or ambiguous locations."
+  },
+  {
+    "source": "alfworld-object-locator",
+    "target": "alfworld-locate-target-object",
+    "type": "compose_with",
+    "reason": "The object locator proposes likely locations, and the target-object locator navigates there to confirm the object."
+  },
+  {
+    "source": "alfworld-locate-target-object",
+    "target": "alfworld-location-navigator",
+    "type": "depend_on",
+    "reason": "Confirming a target object's location requires physically reaching the suspected location."
+  },
+  {
+    "source": "alfworld-tool-locator",
+    "target": "alfworld-tool-user",
+    "type": "compose_with",
+    "reason": "The tool must be found before it can be used on a target object."
+  },
+  {
+    "source": "alfworld-receptacle-searcher",
+    "target": "alfworld-receptacle-finder",
+    "type": "similar_to",
+    "reason": "Both skills search for a suitable receptacle, differing mainly in search breadth and search strategy."
+  },
+  {
+    "source": "alfworld-storage-explorer",
+    "target": "alfworld-receptacle-searcher",
+    "type": "belong_to",
+    "reason": "Storage exploration is a narrower version of receptacle searching focused on drawers, cabinets, and other storage units."
+  },
+  {
+    "source": "alfworld-receptacle-finder",
+    "target": "alfworld-receptacle-preparer",
+    "type": "compose_with",
+    "reason": "After finding a suitable receptacle, the agent typically needs to verify and prepare it for placement."
+  },
+  {
+    "source": "alfworld-open-receptacle",
+    "target": "alfworld-receptacle-opener",
+    "type": "similar_to",
+    "reason": "Both skills open a closed receptacle to expose its contents for further interaction."
+  },
+  {
+    "source": "alfworld-receptacle-opener",
+    "target": "alfworld-receptacle-operator",
+    "type": "belong_to",
+    "reason": "Opening a receptacle is one branch of the broader receptacle-operator skill."
+  },
+  {
+    "source": "alfworld-receptacle-closer",
+    "target": "alfworld-receptacle-operator",
+    "type": "belong_to",
+    "reason": "Closing a receptacle is the complementary branch of the broader receptacle-operator skill."
+  },
+  {
+    "source": "alfworld-receptacle-preparer",
+    "target": "alfworld-receptacle-operator",
+    "type": "compose_with",
+    "reason": "Preparing a receptacle usually requires deciding whether to open or close it before use."
+  },
+  {
+    "source": "alfworld-appliance-preparer",
+    "target": "alfworld-receptacle-preparer",
+    "type": "belong_to",
+    "reason": "Appliance preparation is a specialized form of receptacle preparation for microwaves, fridges, and similar stations."
+  },
+  {
+    "source": "alfworld-appliance-preparer",
+    "target": "alfworld-appliance-navigator",
+    "type": "compose_with",
+    "reason": "An appliance must first be reached before it can be prepared for use."
+  },
+  {
+    "source": "alfworld-object-picker",
+    "target": "alfworld-object-retriever",
+    "type": "similar_to",
+    "reason": "Both acquire an object into inventory once its location is known."
+  },
+  {
+    "source": "alfworld-object-retriever",
+    "target": "alfworld-inventory-management",
+    "type": "compose_with",
+    "reason": "After retrieving an object, inventory tracking helps maintain counts and decide what still needs to be found."
+  },
+  {
+    "source": "alfworld-object-transporter",
+    "target": "alfworld-object-retriever",
+    "type": "depend_on",
+    "reason": "Transporting an object requires first acquiring it from the source receptacle."
+  },
+  {
+    "source": "alfworld-object-transporter",
+    "target": "alfworld-object-placer",
+    "type": "compose_with",
+    "reason": "Transport naturally culminates in placing the carried object at the destination."
+  },
+  {
+    "source": "alfworld-object-placer",
+    "target": "alfworld-receptacle-preparer",
+    "type": "compose_with",
+    "reason": "Successful placement depends on the destination receptacle being accessible and ready."
+  },
+  {
+    "source": "alfworld-object-storer",
+    "target": "alfworld-object-placer",
+    "type": "belong_to",
+    "reason": "Storage is a specific object-placement scenario focused on placing an item into a validated storage location."
+  },
+  {
+    "source": "alfworld-object-disposer",
+    "target": "alfworld-object-placer",
+    "type": "belong_to",
+    "reason": "Disposal is a specific case of placing an object into a garbage or discard receptacle."
+  },
+  {
+    "source": "alfworld-object-state-inspector",
+    "target": "alfworld-task-verifier",
+    "type": "compose_with",
+    "reason": "State inspection produces evidence that the task verifier uses to judge whether the goal has been satisfied."
+  },
+  {
+    "source": "alfworld-task-verifier",
+    "target": "alfworld-inventory-management",
+    "type": "compose_with",
+    "reason": "Task verification often needs inventory state to determine whether all required objects have been collected or placed."
+  },
+  {
+    "source": "alfworld-temperature-regulator",
+    "target": "alfworld-object-state-modifier",
+    "type": "belong_to",
+    "reason": "Temperature regulation is a specialized subclass of object state modification."
+  },
+  {
+    "source": "alfworld-object-heater",
+    "target": "alfworld-temperature-regulator",
+    "type": "belong_to",
+    "reason": "Heating is one specific temperature-regulation operation."
+  },
+  {
+    "source": "alfworld-object-cooler",
+    "target": "alfworld-temperature-regulator",
+    "type": "belong_to",
+    "reason": "Cooling is the complementary temperature-regulation operation."
+  },
+  {
+    "source": "alfworld-heat-object-with-appliance",
+    "target": "alfworld-object-heater",
+    "type": "belong_to",
+    "reason": "Heating with a named appliance is a narrower version of the generic object-heating skill."
+  },
+  {
+    "source": "alfworld-clean-object",
+    "target": "alfworld-object-state-modifier",
+    "type": "belong_to",
+    "reason": "Cleaning is a specific type of state modification focused on cleanliness."
+  },
+  {
+    "source": "alfworld-object-state-modifier",
+    "target": "alfworld-appliance-preparer",
+    "type": "compose_with",
+    "reason": "Changing object state with an appliance usually requires the appliance to be prepared first."
+  },
+  {
+    "source": "alfworld-object-state-modifier",
+    "target": "alfworld-object-state-inspector",
+    "type": "compose_with",
+    "reason": "State modification is commonly paired with state inspection to verify whether the desired state has been reached."
+  },
+  {
+    "source": "alfworld-object-cooler",
+    "target": "alfworld-appliance-preparer",
+    "type": "depend_on",
+    "reason": "Cooling an object requires a reachable, ready cooling appliance such as a fridge."
+  },
+  {
+    "source": "alfworld-heat-object-with-appliance",
+    "target": "alfworld-appliance-preparer",
+    "type": "depend_on",
+    "reason": "Heating with an appliance requires the appliance to be in the right open or closed state first."
+  },
+  {
+    "source": "alfworld-clean-object",
+    "target": "alfworld-receptacle-preparer",
+    "type": "depend_on",
+    "reason": "Cleaning often depends on preparing the sink or other cleaning receptacle for use."
+  },
+  {
+    "source": "alfworld-tool-user",
+    "target": "alfworld-device-operator",
+    "type": "similar_to",
+    "reason": "Both skills use a tool or device to act on a target object, differing mainly in the type of instrument being used."
+  },
+  {
+    "source": "alfworld-device-operator",
+    "target": "alfworld-tool-locator",
+    "type": "compose_with",
+    "reason": "Before operating a device on an object, the agent often needs to find that device in the environment."
+  },
+  {
+    "source": "alfworld-receptacle-searcher",
+    "target": "alfworld-receptacle-navigator",
+    "type": "compose_with",
+    "reason": "Searching for a receptacle requires moving between candidate receptacle locations."
+  },
+  {
+    "source": "alfworld-object-locator",
+    "target": "alfworld-search-pattern-executor",
+    "type": "compose_with",
+    "reason": "Once likely object locations are hypothesized, the search-pattern executor can traverse them systematically."
+  },
+  {
+    "source": "alfworld-locate-target-object",
+    "target": "alfworld-object-retriever",
+    "type": "compose_with",
+    "reason": "Once the target object is visually confirmed, the next step is usually to retrieve it."
+  },
+  {
+    "source": "alfworld-environment-scanner",
+    "target": "alfworld-search-pattern-executor",
+    "type": "compose_with",
+    "reason": "The initial scan provides the set of visible receptacles and objects that a systematic search will iterate through."
+  },
+  {
+    "source": "alfworld-object-storer",
+    "target": "alfworld-receptacle-finder",
+    "type": "compose_with",
+    "reason": "Storing an object usually starts with finding a suitable target receptacle."
+  },
+  {
+    "source": "alfworld-object-disposer",
+    "target": "alfworld-receptacle-searcher",
+    "type": "compose_with",
+    "reason": "Disposal often begins by locating a garbage or other valid disposal receptacle."
+  }
+]

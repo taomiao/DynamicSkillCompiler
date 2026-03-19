@@ -2,6 +2,7 @@ from skillnet_ai.compiler.models import (
     CompilationMetrics,
     CompiledSkill,
     CompiledSkillPackage,
+    CompilerPassTrace,
     LocalEnvironment,
     QueryPlan,
     SkillAsset,
@@ -12,6 +13,13 @@ from skillnet_ai.compiler.models import (
 )
 from skillnet_ai.compiler.decompose import TaskDecomposer
 from skillnet_ai.compiler.fragments import FragmentMatcher, SkillFragmentExtractor
+from skillnet_ai.compiler.graph import (
+    DEFAULT_GRAPH_PASSES,
+    GRAPH_PASS_PRESETS,
+    LEGACY_DEFAULT_GRAPH_PASSES,
+    SLIM_GRAPH_PASSES,
+    SUPPORTED_GRAPH_PASSES,
+)
 from skillnet_ai.compiler.grounding import EnvironmentGrounder
 from skillnet_ai.compiler.pipeline import CompilerConfig, DynamicSkillCompiler
 from skillnet_ai.compiler.query import QueryOptimizer
@@ -27,12 +35,16 @@ __all__ = [
     "CompilationMetrics",
     "CompiledSkill",
     "CompiledSkillPackage",
+    "CompilerPassTrace",
     "CompilerConfig",
     "CompositeSkillRetriever",
+    "DEFAULT_GRAPH_PASSES",
     "DynamicSkillCompiler",
     "EnvironmentGrounder",
     "FragmentMatcher",
+    "GRAPH_PASS_PRESETS",
     "InMemorySkillRetriever",
+    "LEGACY_DEFAULT_GRAPH_PASSES",
     "LocalSkillLibraryRetriever",
     "LocalEnvironment",
     "QueryOptimizer",
@@ -44,6 +56,8 @@ __all__ = [
     "SkillNetSearchRetriever",
     "SkillRelation",
     "SkillRetriever",
+    "SLIM_GRAPH_PASSES",
     "Subgoal",
+    "SUPPORTED_GRAPH_PASSES",
     "TaskDecomposer",
 ]

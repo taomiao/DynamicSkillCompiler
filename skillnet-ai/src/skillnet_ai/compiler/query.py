@@ -11,15 +11,27 @@ STOPWORDS = {
     "a", "an", "and", "are", "at", "be", "by", "for", "from", "how", "i", "in",
     "into", "is", "it", "of", "on", "or", "please", "that", "the", "this", "to",
     "using", "with", "your", "task", "first", "next", "then", "located", "around",
-    "degrees", "degree", "celsius", "called", "which", "if",
+    "degrees", "degree", "celsius", "called", "which", "if", "also", "will",
+    "acceptable", "without", "actions", "action",
+}
+
+LOW_SIGNAL_CAPABILITIES = {
+    "acceptable", "action", "also", "compound", "compounds", "its", "matter",
+    "point", "without", "will", "cause", "caus", "matt",
 }
 
 INTENT_KEYWORDS: Dict[str, Set[str]] = {
     "analyze": {"analyze", "inspect", "understand", "study"},
     "build": {"build", "create", "develop", "generate", "implement"},
     "retrieve": {"find", "search", "lookup", "query"},
-    "transform": {"convert", "compile", "rewrite", "refactor", "optimize"},
-    "evaluate": {"evaluate", "verify", "test", "benchmark", "compare"},
+    "transform": {
+        "convert", "compile", "rewrite", "refactor", "optimize", "boil",
+        "melt", "freeze", "heat", "cool", "chang", "transform",
+    },
+    "evaluate": {
+        "evaluate", "verify", "test", "benchmark", "compare", "measure",
+        "monitor", "temperature", "threshold",
+    },
     "localize": {"local", "localize", "workspace", "environment"},
 }
 
@@ -33,15 +45,32 @@ CONSTRAINT_KEYWORDS = {
 SYNONYM_EXPANSIONS: Dict[str, Set[str]] = {
     "put": {"place", "placer", "move", "transfer"},
     "place": {"put", "placer", "move"},
-    "cool": {"cooler", "cooling", "temperature", "cold"},
-    "heat": {"heater", "heating", "temperature", "warm"},
+    "cool": {"cooler", "cooling", "temperature", "cold", "freeze"},
+    "heat": {"heater", "heating", "temperature", "warm", "boil", "melt"},
+    "boil": {"heat", "vaporize", "phase", "state"},
+    "melt": {"heat", "liquid", "phase", "state"},
+    "freeze": {"cool", "solid", "phase", "state"},
     "pick": {"take", "picker", "retrieve", "retriever"},
     "buy": {"purchase", "checkout", "order"},
     "purchase": {"buy", "checkout", "order"},
     "find": {"search", "locate", "identify"},
     "analyze": {"analysis", "inspect", "reason"},
     "test": {"evaluate", "measure", "verify"},
+    "focus": {"attention", "target"},
+    "measure": {"monitor", "temperature", "threshold"},
+    "container": {"pot", "beaker", "cup", "jar"},
+    "monitor": {"observe", "check", "verify", "wait"},
 }
+
+PHRASE_CAPABILITY_RULES = (
+    (r"\bstate of matter\b", ("state", "change", "phase", "substance")),
+    (r"\bchange (?:its |the )?state(?: of matter)?\b", ("change", "phase", "transform")),
+    (r"\bboiling point\b", ("boil",)),
+    (r"\bmelting point\b", ("melt",)),
+    (r"\bfreezing point\b", ("freeze",)),
+    (r"\bwithout (?:a )?boiling point\b", ("combust", "fallback")),
+    (r"\bfocus on\b", ("focus",)),
+)
 
 
 @dataclass
@@ -49,9 +78,8 @@ class QueryOptimizer:
     max_keyword_terms: int = 6
 
     def optimize(self, query: str) -> QueryPlan:
-        normalized = self._normalize(query)
-        tokens = [token for token in normalized.split() if token not in STOPWORDS]
-        expanded_tokens = self._expand_tokens(tokens)
+        normalized = self.normalize_text(query)
+        expanded_tokens = self.extract_content_terms(query)
         keyword_terms = expanded_tokens[: self.max_keyword_terms]
         intents = self._infer_intents(set(expanded_tokens))
         constraints = self._infer_constraints(set(expanded_tokens))
@@ -69,6 +97,62 @@ class QueryOptimizer:
             optional_capabilities=optional,
             constraints=constraints,
         )
+
+    def normalize_text(self, query: str, preserve_delimiters: bool = False) -> str:
+        if preserve_delimiters:
+            collapsed = re.sub(r"[^a-zA-Z0-9_\-/.,;!? ]+", " ", query.lower())
+        else:
+            collapsed = re.sub(r"[^a-zA-Z0-9_\-/ ]+", " ", query.lower())
+        collapsed = re.sub(r"\b\d+(?:\.\d+)?\b", " ", collapsed)
+        return re.sub(r"\s+", " ", collapsed).strip()
+
+    def extract_content_terms(self, query: str) -> List[str]:
+        normalized = self.normalize_text(query)
+        tokens = self.normalize_capability_tokens(normalized.split())
+        phrase_tokens = self._extract_phrase_capabilities(query)
+        base_terms = list(dict.fromkeys(tokens + phrase_tokens))
+        return self._expand_tokens(base_terms)
+
+    def normalize_capability_tokens(self, tokens: List[str]) -> List[str]:
+        normalized_tokens: List[str] = []
+        for token in tokens:
+            normalized = self.normalize_capability_token(token)
+            if normalized:
+                normalized_tokens.append(normalized)
+        return normalized_tokens
+
+    def normalize_capability_token(self, token: str) -> str:
+        token = token.strip().lower()
+        if not token:
+            return ""
+        if "_" in token:
+            parts = [self.normalize_capability_token(part) for part in token.split("_")]
+            parts = [part for part in parts if part]
+            if not parts:
+                return ""
+            return "_".join(parts) if len(parts) > 1 else parts[0]
+        if token in STOPWORDS or len(token) <= 2:
+            return ""
+        for suffix in ("ing", "ers", "er", "or", "ion", "ed", "es", "s"):
+            if token.endswith(suffix) and len(token) > len(suffix) + 2:
+                token = token[: -len(suffix)]
+                break
+        if token in STOPWORDS or token in LOW_SIGNAL_CAPABILITIES or len(token) <= 2:
+            return ""
+        return token
+
+    def infer_structural_capabilities(self, tokens: Set[str]) -> Set[str]:
+        inferred: Set[str] = set()
+        phase_change_signal = bool(tokens & {"boil", "melt", "freeze", "heat", "cool", "state", "chang"})
+        if phase_change_signal:
+            inferred |= {"contain", "apparatu", "monit", "wait"}
+        if tokens & {"temperature", "measure", "threshold"}:
+            inferred |= {"monit", "examine"}
+        if tokens & {"substance", "liquid", "solid", "vapor"}:
+            inferred |= {"contain"}
+        if tokens & {"combust"}:
+            inferred |= {"heat", "apparatu"}
+        return inferred
 
     def _normalize(self, query: str) -> str:
         collapsed = re.sub(r"[^a-zA-Z0-9_\-/ ]+", " ", query.lower())
@@ -92,6 +176,7 @@ class QueryOptimizer:
 
     def _expand_optional(self, tokens: List[str]) -> Set[str]:
         optional = set(tokens)
+        optional |= self.infer_structural_capabilities(set(tokens))
         for left, right in zip(tokens, tokens[1:]):
             optional.add(f"{left}_{right}")
         return optional
@@ -112,17 +197,31 @@ class QueryOptimizer:
 
     def _variants_for_token(self, token: str) -> List[str]:
         variants = [token]
-        if token.endswith("ing") and len(token) > 4:
-            variants.append(token[:-3])
-        if token.endswith("ed") and len(token) > 3:
-            variants.append(token[:-2])
-        if token.endswith("es") and len(token) > 4 and not token.endswith("sses"):
-            variants.append(token[:-2])
-        elif token.endswith("s") and len(token) > 3 and not token.endswith(("ss", "us")):
-            variants.append(token[:-1])
         if token in SYNONYM_EXPANSIONS:
-            variants.extend(sorted(SYNONYM_EXPANSIONS[token]))
+            variants.extend(
+                normalized
+                for normalized in (
+                    self.normalize_capability_token(candidate)
+                    for candidate in sorted(SYNONYM_EXPANSIONS[token])
+                )
+                if normalized
+            )
         return variants
+
+    def _extract_phrase_capabilities(self, query: str) -> List[str]:
+        lowered = query.lower()
+        extracted: List[str] = []
+        for pattern, capabilities in PHRASE_CAPABILITY_RULES:
+            if re.search(pattern, lowered):
+                extracted.extend(
+                    normalized
+                    for normalized in (
+                        self.normalize_capability_token(capability)
+                        for capability in capabilities
+                    )
+                    if normalized
+                )
+        return list(dict.fromkeys(extracted))
 
     def _build_semantic_queries(
         self,

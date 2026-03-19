@@ -139,6 +139,7 @@ class LocalSkillLibraryRetriever:
                 continue
             skill_md = os.path.join(entry.path, "SKILL.md")
             description = self._read_description(skill_md)
+            instructions = self._read_instructions(skill_md, description)
             asset = SkillAsset(
                 skill_id=entry.name,
                 name=entry.name,
@@ -149,7 +150,7 @@ class LocalSkillLibraryRetriever:
                 token_cost=self._estimate_token_cost(skill_md),
                 execution_cost=1.0,
                 latency_ms=50.0,
-                instructions=[description],
+                instructions=instructions,
             )
             assets[asset.skill_id] = asset
 
@@ -199,6 +200,42 @@ class LocalSkillLibraryRetriever:
             if cleaned and not cleaned.startswith("#"):
                 return cleaned
         return "No description provided."
+
+    def _read_instructions(self, skill_md: str, description: str) -> List[str]:
+        if not os.path.isfile(skill_md):
+            return [description]
+        try:
+            with open(skill_md, "r", encoding="utf-8", errors="ignore") as file:
+                content = file.read()
+        except Exception:
+            return [description]
+
+        body = re.sub(r"^---\n.*?\n---\n?", "", content, flags=re.DOTALL)
+        instructions: List[str] = []
+        for raw_line in body.splitlines():
+            cleaned = raw_line.strip()
+            if not cleaned:
+                continue
+            if cleaned.startswith("#"):
+                continue
+            cleaned = re.sub(r"^[-*]\s*", "", cleaned)
+            cleaned = re.sub(r"^\d+\.\s*", "", cleaned)
+            cleaned = cleaned.replace("**", "").replace("`", "")
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if not cleaned or cleaned.lower() == description.lower():
+                continue
+            instructions.append(cleaned)
+
+        if not instructions:
+            return [description]
+
+        merged = [description]
+        for instruction in instructions:
+            if instruction not in merged:
+                merged.append(instruction)
+            if len(merged) >= 14:
+                break
+        return merged
 
     def _extract_capabilities(self, name: str, description: str) -> set[str]:
         return _extract_capabilities(name, description)
