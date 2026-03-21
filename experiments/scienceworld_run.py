@@ -22,6 +22,7 @@ from scienceworld import ScienceWorldEnv
 
 from src.scienceworld.prompts.system_prompt import scienceworld_system_prompt
 from src.skill import SkillModule
+from src.runtime_recompile import execute_compiled_procedure
 from src.utils import chat_completion
 
 
@@ -234,6 +235,29 @@ def run_standard_procedure(env, llm, model, messages, max_steps):
 
     return messages, task_done, task_reward, current_steps
 
+
+def _scienceworld_step_adapter(action, result):
+    observation, step_reward, task_done, info = result
+    score = info.get("score") if isinstance(info, dict) else None
+    task_reward = score if score is not None else step_reward
+    return {
+        "action": action,
+        "observation": observation,
+        "task_done": task_done,
+        "task_reward": task_reward,
+    }
+
+
+def _invoke_compiled_scienceworld(func, env, model, messages, remaining_steps):
+    return func(
+        env,
+        llm,
+        model,
+        parse_action,
+        messages,
+        remaining_steps,
+    )
+
 # ==========================================
 # Core Execution Logic
 # ==========================================
@@ -281,48 +305,35 @@ def scienceworld_run_single(env, task_name, var_idx, args, Skill_Module=None, pr
             progress_callback("skills_retrieved", {"relevant_skill_names": relevant_skill_names})
     
     if use_skill:
-        if progress_callback:
-            progress_callback("generating_procedure")
         ensure_task_not_timed_out()
-        overall_procedure = Skill_Module.generate_overall_procedure(query, relevant_skill_names)
-        print(f'\n{Colors.BLUE}Generated Overall Procedure:\n{overall_procedure}{Colors.RESET}')
-        if progress_callback:
-            progress_callback("procedure_generated")
-
-        MAX_RETRIES = 3
-        retries = 0
-        while retries < MAX_RETRIES:
-            try:
-                if progress_callback:
-                    progress_callback("generating_procedure_code", {"retry": retries})
-                ensure_task_not_timed_out()
-                overall_procedure_code = Skill_Module.generate_overall_procedure_code(query, overall_procedure)
-                print(f'\n{Colors.BLUE}Generated Procedure Code:\n{overall_procedure_code}{Colors.RESET}')
-                if progress_callback:
-                    progress_callback("procedure_code_generated")
-
-                namespace = {}
-                exec(overall_procedure_code, namespace)
-                func = namespace.get("overall_procedure_code")
-                
-                if func:
-                    if progress_callback:
-                        progress_callback("executing_procedure")
-                    ensure_task_not_timed_out()
-                    messages, task_done, task_reward, steps = func(
-                        env, llm, args.model, parse_action, messages, args.max_steps
-                    )
-                else:
-                    raise ValueError("Function 'overall_procedure_code' not found in generated code.")
-                
-                if task_done:
-                    print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
-                    break 
-            except Exception as e:
-                print(f'Error loading/executing procedure script: {e}')
-                if progress_callback:
-                    progress_callback("procedure_retry", {"retry": retries, "error": str(e)})
-                retries += 1
+        compiled_result = execute_compiled_procedure(
+            env=env,
+            llm=llm,
+            model=args.model,
+            task_prompt=query,
+            messages=messages,
+            max_steps=args.max_steps,
+            skill_module=Skill_Module,
+            selected_skill_names=relevant_skill_names,
+            step_adapter=_scienceworld_step_adapter,
+            invoke=lambda func, proxy, msg_history, remaining: _invoke_compiled_scienceworld(
+                func,
+                proxy,
+                args.model,
+                msg_history,
+                remaining,
+            ),
+            progress_callback=progress_callback,
+        )
+        messages = compiled_result["messages"]
+        task_done = compiled_result["task_done"]
+        task_reward = compiled_result["task_reward"]
+        steps = compiled_result["steps"]
+        relevant_skill_names = compiled_result["skill_names"]
+        overall_procedure = compiled_result["overall_procedure"]
+        overall_procedure_code = compiled_result["overall_procedure_code"]
+        if task_done:
+            print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
     else:
         if progress_callback:
             progress_callback("running_standard_procedure")
@@ -356,6 +367,8 @@ def scienceworld_run_single(env, task_name, var_idx, args, Skill_Module=None, pr
             if Skill_Module and Skill_Module.last_compilation is not None
             else None
         ),
+        "runtime_recompile_count": getattr(Skill_Module, "runtime_recompile_count", 0) if Skill_Module else 0,
+        "runtime_recompile_events": getattr(Skill_Module, "runtime_recompile_events", []) if Skill_Module else [],
     }
 
 # ==========================================

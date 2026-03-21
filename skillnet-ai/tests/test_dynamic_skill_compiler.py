@@ -3,6 +3,10 @@ import os
 import tempfile
 import unittest
 
+from experiments.src.runtime_recompile import (
+    RuntimeRecompileController,
+    execute_compiled_procedure,
+)
 from skillnet_ai.compiler import (
     CompilerConfig,
     GRAPH_PASS_PRESETS,
@@ -82,6 +86,350 @@ class QueryOptimizerTest(unittest.TestCase):
 
 
 class DynamicSkillCompilerTest(unittest.TestCase):
+    def test_search_profile_uses_generic_budget_and_runtime_expands(self):
+        retriever = InMemorySkillRetriever([])
+        initial_compiler = DynamicSkillCompiler(
+            retriever=retriever,
+            config=CompilerConfig(compile_stage="initial"),
+        )
+        runtime_compiler = DynamicSkillCompiler(
+            retriever=retriever,
+            config=CompilerConfig(compile_stage="runtime_recompile"),
+        )
+        query = "Find a white dress lower than 50 dollars and buy it."
+        environment = LocalEnvironment()
+        query_plan = QueryOptimizer().optimize(query)
+        subgoals = TaskDecomposer().decompose(query_plan)
+
+        initial = initial_compiler._effective_config(query_plan, subgoals, environment)
+        runtime = runtime_compiler._effective_config(query_plan, subgoals, environment)
+
+        self.assertEqual(initial.profile_name, "search")
+        self.assertEqual(initial.max_selected_skills, 5)
+        self.assertEqual(initial.max_support_skills, 2)
+        self.assertGreaterEqual(initial.action_driver_bonus, 0.08)
+        self.assertGreaterEqual(initial.support_skill_penalty, 0.05)
+        self.assertGreaterEqual(initial.coverage_floor, 0.18)
+        self.assertEqual(runtime.profile_name, "search")
+        self.assertEqual(runtime.max_selected_skills, 6)
+        self.assertEqual(runtime.max_support_skills, 3)
+        self.assertLess(runtime.support_skill_penalty, initial.support_skill_penalty)
+        self.assertGreater(runtime.coverage_floor, initial.coverage_floor)
+
+    def test_workflow_profile_prefers_coverage_first_without_hard_budget(self):
+        retriever = InMemorySkillRetriever([])
+        compiler = DynamicSkillCompiler(
+            retriever=retriever,
+            config=CompilerConfig(compile_stage="initial"),
+        )
+        query = (
+            "Measure the temperature of the substance, then move it to the green box "
+            "if it is above 50 degrees celsius after heating."
+        )
+        environment = LocalEnvironment()
+        query_plan = QueryOptimizer().optimize(query)
+        subgoals = TaskDecomposer().decompose(query_plan)
+
+        effective = compiler._effective_config(query_plan, subgoals, environment)
+
+        self.assertEqual(effective.profile_name, "workflow")
+        self.assertEqual(effective.graph_passes, GRAPH_PASS_PRESETS["coverage_first"])
+        self.assertGreaterEqual(effective.preserve_top_k, 4)
+        self.assertGreaterEqual(effective.coverage_floor, 0.50)
+        self.assertEqual(effective.max_selected_skills, 0)
+
+    def test_discovery_profile_prefers_coverage_and_wider_budget(self):
+        retriever = InMemorySkillRetriever([])
+        compiler = DynamicSkillCompiler(
+            retriever=retriever,
+            config=CompilerConfig(compile_stage="initial"),
+        )
+        query = "Find the animal with the shortest life span and focus on it."
+        environment = LocalEnvironment()
+        query_plan = QueryOptimizer().optimize(query)
+        subgoals = TaskDecomposer().decompose(query_plan)
+
+        effective = compiler._effective_config(query_plan, subgoals, environment)
+
+        self.assertEqual(effective.profile_name, "discovery")
+        self.assertEqual(effective.graph_passes, GRAPH_PASS_PRESETS["coverage_first"])
+        self.assertGreaterEqual(effective.preserve_top_k, 4)
+        self.assertEqual(effective.max_selected_skills, 6)
+        self.assertGreaterEqual(effective.coverage_floor, 0.34)
+
+    def test_execute_compiled_procedure_allows_first_runtime_recompile(self):
+        class DummyEnv:
+            def __init__(self):
+                self.calls = 0
+
+            def step(self, action):
+                self.calls += 1
+                if self.calls == 1:
+                    return {
+                        "action": action,
+                        "observation": "No results found on this page.",
+                        "task_done": False,
+                        "task_reward": 0.0,
+                    }
+                return {
+                    "action": action,
+                    "observation": "Purchase complete.",
+                    "task_done": True,
+                    "task_reward": 1.0,
+                }
+
+        class DummySkillModule:
+            def __init__(self):
+                self.runtime_recompile_enabled = True
+                self.runtime_recompile_max_count = 1
+                self.runtime_recompile_min_interval_steps = 1
+                self.runtime_recompile_stagnation_threshold = 2
+                self.runtime_recompile_min_remaining_steps = 1
+                self.runtime_recompile_trace_tail = 4
+                self.runtime_recompile_count = 0
+                self.runtime_recompile_events = []
+                self.runtime_last_recompile_step = -999
+                self.retrieved_tasks = []
+                self.procedure_prompts = []
+
+            def _infer_benchmark(self):
+                return "webshop"
+
+            def should_use_runtime_recompile(self):
+                return True
+
+            def can_runtime_recompile(self):
+                return self.runtime_recompile_count < self.runtime_recompile_max_count
+
+            def generate_overall_procedure(self, task_prompt, skill_names):
+                self.procedure_prompts.append((task_prompt, list(skill_names)))
+                return "1. Take the next best action."
+
+            def generate_overall_procedure_code(self, task_prompt, overall_procedure):
+                return (
+                    "def overall_procedure_code(env, llm, messages, max_steps):\n"
+                    "    return messages, False, 0.0, 0\n"
+                )
+
+            def record_runtime_recompile(self, decision):
+                self.runtime_recompile_count += 1
+                self.runtime_recompile_events.append(dict(decision))
+                self.runtime_last_recompile_step = int(decision.get("step_index", -999))
+
+            def build_runtime_recompile_task(self, task_prompt, messages, decision, remaining_steps):
+                return "[Runtime Recompile]\\nNeed a smaller action-driving skill set."
+
+            def retrieve_relevant_skills(self, task, carryover_skill_names=None):
+                self.retrieved_tasks.append(task)
+                return ["webshop-search-executor", "webshop-purchase-executor"]
+
+        def step_adapter(action, result):
+            return dict(result)
+
+        def invoke(func, env, messages, remaining_steps):
+            result = env.step("search[white dress]")
+            observation = result["observation"]
+            messages = list(messages) + [{"role": "user", "content": f"Observation: {observation}"}]
+            return messages, bool(result["task_done"]), float(result["task_reward"]), 1
+
+        env = DummyEnv()
+        skill_module = DummySkillModule()
+        result = execute_compiled_procedure(
+            env=env,
+            llm=lambda *args, **kwargs: None,
+            model="o4-mini",
+            task_prompt="Find a white dress lower than 50 dollars and buy it.",
+            messages=[],
+            max_steps=4,
+            skill_module=skill_module,
+            selected_skill_names=["webshop-query-parser", "webshop-search-formulator"],
+            step_adapter=step_adapter,
+            invoke=invoke,
+        )
+
+        self.assertEqual(skill_module.runtime_recompile_count, 1)
+        self.assertEqual(len(skill_module.retrieved_tasks), 1)
+        self.assertEqual(result["skill_names"], ["webshop-search-executor", "webshop-purchase-executor"])
+        self.assertTrue(result["task_done"])
+        self.assertEqual(result["task_reward"], 1.0)
+        self.assertEqual(result["steps"], 2)
+
+    def test_execute_compiled_procedure_runtime_recompile_can_preserve_previous_scaffold(self):
+        class DummyEnv:
+            def __init__(self):
+                self.calls = 0
+
+            def step(self, action):
+                self.calls += 1
+                if self.calls == 1:
+                    return {
+                        "action": action,
+                        "observation": "No known action matches that input.",
+                        "task_done": False,
+                        "task_reward": 0.4,
+                    }
+                return {
+                    "action": action,
+                    "observation": "Task complete.",
+                    "task_done": True,
+                    "task_reward": 1.0,
+                }
+
+        class DummySkillModule:
+            def __init__(self):
+                self.runtime_recompile_enabled = True
+                self.runtime_recompile_max_count = 1
+                self.runtime_recompile_min_interval_steps = 1
+                self.runtime_recompile_stagnation_threshold = 2
+                self.runtime_recompile_min_remaining_steps = 1
+                self.runtime_recompile_trace_tail = 4
+                self.runtime_recompile_count = 0
+                self.runtime_recompile_events = []
+                self.runtime_last_recompile_step = -999
+
+            def _infer_benchmark(self):
+                return "scienceworld"
+
+            def should_use_runtime_recompile(self):
+                return True
+
+            def can_runtime_recompile(self):
+                return self.runtime_recompile_count < self.runtime_recompile_max_count
+
+            def generate_overall_procedure(self, task_prompt, skill_names):
+                return "1. Take the next best action."
+
+            def generate_overall_procedure_code(self, task_prompt, overall_procedure):
+                return (
+                    "def overall_procedure_code(env, llm, messages, max_steps):\n"
+                    "    return messages, False, 0.0, 0\n"
+                )
+
+            def record_runtime_recompile(self, decision):
+                self.runtime_recompile_count += 1
+                self.runtime_recompile_events.append(dict(decision))
+                self.runtime_last_recompile_step = int(decision.get('step_index', -999))
+
+            def build_runtime_recompile_task(self, task_prompt, messages, decision, remaining_steps):
+                return "[Runtime Recompile]\\nKeep the useful scaffold but repair the failed action."
+
+            def retrieve_relevant_skills(self, task, carryover_skill_names=None):
+                return ["scienceworld-liquid-filler"]
+
+            def merge_runtime_recompile_skill_names(self, task, previous_skill_names, refreshed_skill_names, decision=None):
+                return list(refreshed_skill_names) + list(previous_skill_names)
+
+        def step_adapter(action, result):
+            return dict(result)
+
+        def invoke(func, env, messages, remaining_steps):
+            result = env.step("move flower pot 1 to sink")
+            observation = result["observation"]
+            messages = list(messages) + [{"role": "user", "content": f"Observation: {observation}"}]
+            return messages, bool(result["task_done"]), float(result["task_reward"]), 1
+
+        env = DummyEnv()
+        skill_module = DummySkillModule()
+        result = execute_compiled_procedure(
+            env=env,
+            llm=lambda *args, **kwargs: None,
+            model="o4-mini",
+            task_prompt="Grow the seed into a plant.",
+            messages=[],
+            max_steps=4,
+            skill_module=skill_module,
+            selected_skill_names=["scienceworld-pot-preparer", "scienceworld-planting-coordinator"],
+            step_adapter=step_adapter,
+            invoke=invoke,
+        )
+
+        self.assertEqual(
+            result["skill_names"],
+            [
+                "scienceworld-liquid-filler",
+                "scienceworld-pot-preparer",
+                "scienceworld-planting-coordinator",
+            ],
+        )
+        self.assertTrue(result["task_done"])
+        self.assertEqual(result["task_reward"], 1.0)
+
+    def test_runtime_recompile_controller_triggers_on_partial_reward_plateau(self):
+        controller = RuntimeRecompileController(
+            benchmark="scienceworld",
+            enabled=True,
+            selected_skill_names=["scienceworld-growth-focuser"],
+            max_total_steps=30,
+            stagnation_threshold=2,
+            reward_plateau_threshold=4,
+        )
+
+        decision = None
+        for step, observation in enumerate(
+            [
+                "The seed is planted in the pot.",
+                "The plant is sprouting slowly.",
+                "The plant is growing taller.",
+                "The plant has leaves but no flowers yet.",
+                "The plant is still not at reproduction stage.",
+            ],
+            start=1,
+        ):
+            decision = controller.record_step(
+                action=f"wait step {step}",
+                observation=observation,
+                task_done=False,
+                task_reward=38.0,
+            )
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.reason, "reward_plateau")
+
+    def test_runtime_recompile_controller_skips_stagnation_when_progress_is_already_high(self):
+        controller = RuntimeRecompileController(
+            benchmark="scienceworld",
+            enabled=True,
+            selected_skill_names=["scienceworld-conductivity-tester"],
+            max_total_steps=30,
+            stagnation_threshold=2,
+            reward_plateau_threshold=4,
+            high_progress_reward_threshold=0.7,
+        )
+
+        decision = None
+        for _ in range(5):
+            decision = controller.record_step(
+                action="wait1",
+                observation="You decide to wait for 1 iterations.",
+                task_done=False,
+                task_reward=79.0,
+            )
+
+        self.assertIsNone(decision)
+
+    def test_runtime_recompile_controller_ignores_plateau_before_meaningful_progress(self):
+        controller = RuntimeRecompileController(
+            benchmark="scienceworld",
+            enabled=True,
+            selected_skill_names=["scienceworld-temperature-measurer"],
+            max_total_steps=30,
+            stagnation_threshold=3,
+            reward_plateau_threshold=4,
+            reward_plateau_min_progress=0.2,
+            high_progress_reward_threshold=0.7,
+        )
+
+        decision = None
+        for step in range(5):
+            decision = controller.record_step(
+                action=f"search step {step}",
+                observation=f"This room is called room {step}.",
+                task_done=False,
+                task_reward=9.0,
+            )
+
+        self.assertIsNone(decision)
+
     def test_task_decomposition_and_fragment_grounding(self):
         query_plan = QueryOptimizer().optimize("cool the pan and put it on stoveburner")
         subgoals = TaskDecomposer().decompose(query_plan)
@@ -300,6 +648,53 @@ class DynamicSkillCompilerTest(unittest.TestCase):
         selected = {item.asset.skill_id for item in compiled.compiled_skills}
         self.assertIn("core", selected)
         self.assertIn("support", selected)
+
+    def test_coverage_floor_blocks_pruning_of_unique_workflow_support(self):
+        skills = [
+            SkillAsset(
+                skill_id="heater",
+                name="heater-driver",
+                description="Heat the substance in the apparatus.",
+                capabilities={"heat", "apparatu", "transform"},
+                token_cost=2,
+                execution_cost=1,
+            ),
+            SkillAsset(
+                skill_id="monitor",
+                name="temperature-monitor",
+                description="Measure and monitor the temperature of the substance.",
+                capabilities={"measure", "temperature", "monit", "verify"},
+                token_cost=2,
+                execution_cost=1,
+            ),
+            SkillAsset(
+                skill_id="placer",
+                name="conditional-placer",
+                description="Move the substance to the green box after verification.",
+                capabilities={"move", "place", "green", "box"},
+                token_cost=2,
+                execution_cost=1,
+            ),
+        ]
+        compiler = DynamicSkillCompiler(
+            retriever=InMemorySkillRetriever(skills),
+            config=CompilerConfig(
+                min_relevance=0.1,
+                coverage_floor=0.55,
+                graph_passes=GRAPH_PASS_PRESETS["coverage_first"],
+            ),
+        )
+
+        compiled = compiler.compile(
+            "Heat the substance, measure its temperature, then place it in the green box.",
+            environment=LocalEnvironment(),
+        )
+
+        selected = {item.asset.skill_id for item in compiled.compiled_skills}
+        self.assertIn("heater", selected)
+        self.assertIn("monitor", selected)
+        self.assertIn("placer", selected)
+        self.assertGreaterEqual(compiled.metrics.coverage_score, 0.55)
 
     def test_similar_prune_margin_can_disable_aggressive_pruning(self):
         skills = [
@@ -650,14 +1045,13 @@ class DynamicSkillCompilerTest(unittest.TestCase):
 
         selected = {item.asset.skill_id for item in compiled.compiled_skills}
         self.assertIn("focus", selected)
-        self.assertIn("prepare", selected)
         self.assertIn("heat", selected)
         self.assertIn("monitor", selected)
         self.assertNotIn("noise", selected)
         self.assertGreaterEqual(compiled.metrics.coverage_score, 0.6)
         self.assertGreaterEqual(compiled.metrics.covered_subgoal_count, 3)
         self.assertTrue(
-            any("Adaptive compiler config preserved extra workflow support" in note for note in compiled.notes)
+            any("Adaptive compiler config adjusted selection profile" in note for note in compiled.notes)
         )
 
     def test_adaptive_workflow_bias_can_be_disabled_via_config(self):
@@ -729,10 +1123,10 @@ class DynamicSkillCompilerTest(unittest.TestCase):
         self.assertIn("prepare", default_selected)
         self.assertNotIn("prepare", no_bias_selected)
         self.assertTrue(
-            any("Adaptive compiler config preserved extra workflow support" in note for note in default_compiled.notes)
+            any("Adaptive compiler config adjusted selection profile" in note for note in default_compiled.notes)
         )
         self.assertFalse(
-            any("Adaptive compiler config preserved extra workflow support" in note for note in no_bias_compiled.notes)
+            any("Adaptive compiler config adjusted selection profile" in note for note in no_bias_compiled.notes)
         )
 
     def test_prune_overlapping_support_removes_redundant_inspector(self):
@@ -918,13 +1312,13 @@ class DynamicSkillCompilerTest(unittest.TestCase):
 
         first_trace = compiled.pass_traces[0]
         self.assertEqual(first_trace.pass_name, "select_covering_skills")
-        self.assertEqual(first_trace.added, ["b"])
+        self.assertEqual(first_trace.added, ["a", "b"])
         self.assertEqual([trace.pass_name for trace in compiled.pass_traces[:3]], [
             "select_covering_skills",
             "fallback_selection",
             "add_dependencies",
         ])
-        self.assertEqual(compiled.dropped_skills["a"], "relevance_below_threshold")
+        self.assertEqual(compiled.dropped_skills["a"], "dominated_by_similar_skill:b")
 
 
 if __name__ == "__main__":

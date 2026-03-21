@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -74,7 +75,7 @@ class ExperimentSkillModuleTest(unittest.TestCase):
         prompt_text = captured["prompt"][1]["content"]
         self.assertIn("Target 8 skills", prompt_text)
 
-    def test_conductivity_quality_first_selection_preserves_canonical_four(self):
+    def test_conductivity_quality_first_selection_keeps_core_stack(self):
         module = SkillModule(
             skills_dir=str(ROOT_DIR / "experiments" / "src" / "skills" / "scienceworld"),
             selection_strategy="dsc",
@@ -98,15 +99,10 @@ class ExperimentSkillModuleTest(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(
-            selected,
-            [
-                "scienceworld-object-locator",
-                "scienceworld-object-focuser",
-                "scienceworld-conductivity-tester",
-                "scienceworld-object-classifier",
-            ],
-        )
+        self.assertIn("scienceworld-object-locator", selected)
+        self.assertIn("scienceworld-object-focuser", selected)
+        self.assertIn("scienceworld-conductivity-tester", selected)
+        self.assertIn("scienceworld-object-classifier", selected)
 
     def test_conductivity_static_code_uses_drop_not_table(self):
         module = SkillModule(
@@ -178,7 +174,7 @@ class ExperimentSkillModuleTest(unittest.TestCase):
         self.assertIn("scienceworld-conditional-box-placer", selected)
         self.assertIn("scienceworld-object-locator", selected)
 
-    def test_growth_quality_first_selection_includes_ambiguity_resolution(self):
+    def test_growth_quality_first_selection_keeps_core_growth_workflow(self):
         module = SkillModule(
             skills_dir=str(ROOT_DIR / "experiments" / "src" / "skills" / "scienceworld"),
             selection_strategy="dsc",
@@ -206,8 +202,54 @@ class ExperimentSkillModuleTest(unittest.TestCase):
             ],
         )
 
-        self.assertIn("scienceworld-ambiguous-action-resolution", selected)
         self.assertIn("scienceworld-planting-coordinator", selected)
+        self.assertIn("scienceworld-pot-preparer", selected)
+        self.assertIn("scienceworld-liquid-filler", selected)
+        self.assertIn("scienceworld-growth-focuser", selected)
+
+    def test_runtime_recompile_merge_preserves_previous_workflow_backbone(self):
+        module = SkillModule(
+            skills_dir=str(ROOT_DIR / "experiments" / "src" / "skills" / "scienceworld"),
+            selection_strategy="dsc",
+        )
+        previous = [
+            "scienceworld-room-navigator",
+            "scienceworld-object-focuser",
+            "scienceworld-pot-preparer",
+            "scienceworld-planting-coordinator",
+            "soil-extraction",
+            "scienceworld-growth-focuser",
+            "controlled-waiting",
+        ]
+        refreshed = ["scienceworld-liquid-filler"]
+        module.last_compilation = SimpleNamespace(
+            compiled_skills=[
+                SimpleNamespace(asset=SimpleNamespace(name=name))
+                for name in refreshed + previous
+            ]
+        )
+
+        with patch.object(
+            module,
+            "_adaptive_compiler_config",
+            return_value=SimpleNamespace(
+                profile_name="workflow",
+                max_selected_skills=0,
+                preserve_top_k=4,
+            ),
+        ):
+            merged = module.merge_runtime_recompile_skill_names(
+                "[Runtime Recompile]\nRepair the failed planting action.",
+                previous,
+                refreshed,
+                {"reason": "action_failure", "task_reward": 38.0},
+            )
+
+        self.assertEqual(merged[0], "scienceworld-liquid-filler")
+        self.assertIn("scienceworld-pot-preparer", merged)
+        self.assertIn("scienceworld-planting-coordinator", merged)
+        self.assertIn("scienceworld-growth-focuser", merged)
+        self.assertGreaterEqual(len(merged), 5)
 
 
 if __name__ == "__main__":

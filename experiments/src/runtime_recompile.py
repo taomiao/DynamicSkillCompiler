@@ -105,6 +105,13 @@ def _coerce_text(value: Any) -> str:
     return str(_unwrap_singleton(value) or "")
 
 
+def _normalize_reward_value(value: Any) -> float:
+    reward = _coerce_float(value)
+    if reward > 1.0:
+        reward = reward / 100.0
+    return max(0.0, min(reward, 1.0))
+
+
 def _extract_action_text(action: Any) -> str:
     scalar = _unwrap_singleton(action)
     if isinstance(scalar, str):
@@ -195,6 +202,9 @@ class RuntimeRecompileController:
         min_steps_between_recompiles: int = 2,
         stagnation_threshold: int = 2,
         min_remaining_steps_to_recompile: int = 1,
+        reward_plateau_threshold: int = 5,
+        reward_plateau_min_progress: float = 0.2,
+        high_progress_reward_threshold: float = 0.7,
         trace_tail: int = 6,
     ):
         self.benchmark = benchmark or "generic"
@@ -209,12 +219,18 @@ class RuntimeRecompileController:
             1,
             int(min_remaining_steps_to_recompile),
         )
+        self.reward_plateau_threshold = max(3, int(reward_plateau_threshold))
+        self.reward_plateau_min_progress = max(0.0, float(reward_plateau_min_progress))
+        self.high_progress_reward_threshold = max(0.0, float(high_progress_reward_threshold))
         self.trace = deque(maxlen=max(2, int(trace_tail)))
         self.steps_consumed = 0
         self._last_observation_key = ""
         self._last_action_key = ""
         self.repeated_observation_count = 0
         self.repeated_action_count = 0
+        self.best_task_reward = 0.0
+        self.best_task_reward_normalized = 0.0
+        self.steps_since_reward_improvement = 0
 
     def record_step(
         self,
@@ -242,6 +258,14 @@ class RuntimeRecompileController:
 
         self._last_action_key = action_key
         self._last_observation_key = observation_key
+        reward_value = float(task_reward or 0.0)
+        reward_normalized = _normalize_reward_value(task_reward)
+        if reward_value > self.best_task_reward + 1e-6:
+            self.best_task_reward = reward_value
+            self.best_task_reward_normalized = reward_normalized
+            self.steps_since_reward_improvement = 0
+        else:
+            self.steps_since_reward_improvement += 1
         self.trace.append(
             {
                 "step": self.total_steps_before_attempt + self.steps_consumed,
@@ -296,6 +320,15 @@ class RuntimeRecompileController:
                 ):
                     return None
             return "action_failure"
+
+        if self.best_task_reward_normalized >= self.high_progress_reward_threshold:
+            return None
+
+        if (
+            self.best_task_reward_normalized >= self.reward_plateau_min_progress
+            and self.steps_since_reward_improvement >= self.reward_plateau_threshold
+        ):
+            return "reward_plateau"
 
         if self.repeated_observation_count >= self.stagnation_threshold:
             return "stagnation"
@@ -580,9 +613,12 @@ def execute_compiled_procedure(
         retries = 0
         recompile_triggered = False
         while retries < max_script_retries:
+            runtime_recompile_available = bool(
+                getattr(skill_module, "can_runtime_recompile", lambda: False)()
+            )
             controller = RuntimeRecompileController(
                 benchmark=skill_module._infer_benchmark(),
-                enabled=skill_module.should_use_runtime_recompile(),
+                enabled=runtime_recompile_available,
                 selected_skill_names=active_skill_names,
                 max_total_steps=max_steps,
                 total_steps_before_attempt=total_steps,
@@ -601,6 +637,21 @@ def execute_compiled_procedure(
                     skill_module,
                     "runtime_recompile_min_remaining_steps",
                     1,
+                ),
+                reward_plateau_threshold=getattr(
+                    skill_module,
+                    "runtime_recompile_reward_plateau_steps",
+                    5,
+                ),
+                reward_plateau_min_progress=getattr(
+                    skill_module,
+                    "runtime_recompile_reward_plateau_min_progress",
+                    0.2,
+                ),
+                high_progress_reward_threshold=getattr(
+                    skill_module,
+                    "runtime_recompile_high_progress_reward_threshold",
+                    0.7,
                 ),
                 trace_tail=getattr(skill_module, "runtime_recompile_trace_tail", 6),
             )
@@ -656,7 +707,7 @@ def execute_compiled_procedure(
                 recompile_triggered = True
                 if progress_callback:
                     progress_callback("runtime_recompile", decision)
-                if task_done or not skill_module.can_runtime_recompile():
+                if task_done or not runtime_recompile_available:
                     return {
                         "messages": messages,
                         "task_done": task_done,
@@ -672,7 +723,27 @@ def execute_compiled_procedure(
                     decision,
                     remaining_steps=max_steps - total_steps,
                 )
-                active_skill_names = skill_module.retrieve_relevant_skills(active_task_prompt) or list(active_skill_names)
+                try:
+                    refreshed_skill_names = skill_module.retrieve_relevant_skills(
+                        active_task_prompt,
+                        carryover_skill_names=active_skill_names,
+                    )
+                except TypeError:
+                    refreshed_skill_names = skill_module.retrieve_relevant_skills(active_task_prompt)
+                merge_skill_names = getattr(
+                    skill_module,
+                    "merge_runtime_recompile_skill_names",
+                    None,
+                )
+                if callable(merge_skill_names):
+                    active_skill_names = merge_skill_names(
+                        active_task_prompt,
+                        active_skill_names,
+                        refreshed_skill_names,
+                        decision,
+                    )
+                else:
+                    active_skill_names = refreshed_skill_names or list(active_skill_names)
                 print(
                     f"\033[94mRuntime recompile activated ({decision['reason']}). "
                     f"Updated skills: {active_skill_names}\033[0m"

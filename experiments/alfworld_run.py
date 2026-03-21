@@ -18,6 +18,7 @@ import sys
 
 from src.alfworld.prompts.system_prompt import alfworld_system_prompt
 from src.skill import SkillModule
+from src.runtime_recompile import execute_compiled_procedure
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 alfworld_path = os.path.join(current_dir, "alfworld")
@@ -136,6 +137,29 @@ def run_standard_procedure(env, llm, model, process_ob, messages, max_steps):
 
     return messages, task_done, task_reward, current_steps
 
+
+def _alfworld_step_adapter(action, result):
+    observation, _reward, done, info = result
+    action_text = action[0] if isinstance(action, list) and action else action
+    return {
+        "action": action_text,
+        "observation": process_ob(observation[0]) if observation else "",
+        "task_done": done[0] if done else False,
+        "task_reward": info["won"][0] if info and "won" in info else 0.0,
+    }
+
+
+def _invoke_compiled_alfworld(func, env, model, messages, remaining_steps):
+    return func(
+        env,
+        llm,
+        model,
+        process_ob,
+        parse_action,
+        messages,
+        remaining_steps,
+    )
+
 # ==========================================
 # Core Execution Logic
 # ==========================================
@@ -177,32 +201,33 @@ def alfworld_run_single(env, obs=[], names=[], max_steps=30, model=None, Skill_M
 
         # Execute Strategy
         if use_skill:
-            overall_procedure = Skill_Module.generate_overall_procedure(ob, relevant_skill_names)
-            print(f'\n{Colors.BLUE}Generated Overall Procedure:\n{overall_procedure}{Colors.RESET}')
-            
-            MAX_RETRIES = 3
-            retries = 0
-            
-            while retries < MAX_RETRIES:
-                try:
-                    overall_procedure_code = Skill_Module.generate_overall_procedure_code(ob, overall_procedure)
-                    print(f'\n{Colors.BLUE}Generated Overall Procedure Code:\n{overall_procedure_code}{Colors.RESET}')
-
-                    # Dynamic execution of generated procedure
-                    namespace = {}
-                    exec(overall_procedure_code, namespace)
-                    func = namespace["overall_procedure_code"]
-                    
-                    messages, task_done, task_reward, steps = func(
-                        env, llm, model, process_ob, parse_action, messages, max_steps
-                    )
-                    
-                    if task_done:
-                        print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
-                    break 
-                except Exception as e:
-                    print(f'Error loading/executing procedure script: {e}')
-                    retries += 1
+            compiled_result = execute_compiled_procedure(
+                env=env,
+                llm=llm,
+                model=model,
+                task_prompt=ob,
+                messages=messages,
+                max_steps=max_steps,
+                skill_module=Skill_Module,
+                selected_skill_names=relevant_skill_names,
+                step_adapter=_alfworld_step_adapter,
+                invoke=lambda func, proxy, msg_history, remaining: _invoke_compiled_alfworld(
+                    func,
+                    proxy,
+                    model,
+                    msg_history,
+                    remaining,
+                ),
+            )
+            messages = compiled_result["messages"]
+            task_done = compiled_result["task_done"]
+            task_reward = compiled_result["task_reward"]
+            steps = compiled_result["steps"]
+            relevant_skill_names = compiled_result["skill_names"]
+            overall_procedure = compiled_result["overall_procedure"]
+            overall_procedure_code = compiled_result["overall_procedure_code"]
+            if task_done:
+                print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
         else:
             # Fallback to Standard Execution Loop
             messages, task_done, task_reward, steps = run_standard_procedure(
@@ -224,6 +249,8 @@ def alfworld_run_single(env, obs=[], names=[], max_steps=30, model=None, Skill_M
                 if Skill_Module and Skill_Module.last_compilation is not None
                 else None
             ),
+            "runtime_recompile_count": getattr(Skill_Module, "runtime_recompile_count", 0) if Skill_Module else 0,
+            "runtime_recompile_events": getattr(Skill_Module, "runtime_recompile_events", []) if Skill_Module else [],
         })
     
     return results

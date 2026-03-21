@@ -21,6 +21,7 @@ import multiprocessing
 
 from src.webshop.prompts.system_prompt import webshop_system_prompt
 from src.skill import SkillModule
+from src.runtime_recompile import execute_compiled_procedure
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 webshop_candidates = [
@@ -130,6 +131,27 @@ def run_standard_procedure(env, llm, model, messages, max_steps):
     return messages, task_done, task_reward, current_steps
 
 
+def _webshop_step_adapter(action, result):
+    observation, reward, done, _info = result
+    return {
+        "action": action,
+        "observation": observation,
+        "task_done": done,
+        "task_reward": reward,
+    }
+
+
+def _invoke_compiled_webshop(func, env, model, messages, remaining_steps):
+    return func(
+        env,
+        llm,
+        model,
+        parse_action,
+        messages,
+        remaining_steps,
+    )
+
+
 def webshop_run_single(env, ob, instruction_text, max_steps=30, model=None, Skill_Module=None):
     results = []
     
@@ -158,32 +180,33 @@ def webshop_run_single(env, ob, instruction_text, max_steps=30, model=None, Skil
 
     # Execute Strategy
     if use_skill:
-        overall_procedure = Skill_Module.generate_overall_procedure(ob, relevant_skill_names)
-        print(f'\n{Colors.BLUE}Generated Overall Procedure:\n{overall_procedure}{Colors.RESET}')
-        
-        MAX_RETRIES = 3
-        retries = 0
-        
-        while retries < MAX_RETRIES:
-            try:
-                overall_procedure_code = Skill_Module.generate_overall_procedure_code(ob, overall_procedure)
-                print(f'\n{Colors.BLUE}Generated Overall Procedure Code:\n{overall_procedure_code}{Colors.RESET}')
-
-                # Dynamic execution of generated procedure
-                namespace = {}
-                exec(overall_procedure_code, namespace)
-                func = namespace["overall_procedure_code"]
-                
-                messages, task_done, task_reward, steps = func(
-                    env, llm, model, parse_action, messages, max_steps
-                )
-                
-                if task_done:
-                    print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
-                break 
-            except Exception as e:
-                print(f'Error loading/executing procedure script: {e}')
-                retries += 1
+        compiled_result = execute_compiled_procedure(
+            env=env,
+            llm=llm,
+            model=model,
+            task_prompt=ob,
+            messages=messages,
+            max_steps=max_steps,
+            skill_module=Skill_Module,
+            selected_skill_names=relevant_skill_names,
+            step_adapter=_webshop_step_adapter,
+            invoke=lambda func, proxy, msg_history, remaining: _invoke_compiled_webshop(
+                func,
+                proxy,
+                model,
+                msg_history,
+                remaining,
+            ),
+        )
+        messages = compiled_result["messages"]
+        task_done = compiled_result["task_done"]
+        task_reward = compiled_result["task_reward"]
+        steps = compiled_result["steps"]
+        relevant_skill_names = compiled_result["skill_names"]
+        overall_procedure = compiled_result["overall_procedure"]
+        overall_procedure_code = compiled_result["overall_procedure_code"]
+        if task_done:
+            print(f'{Colors.GREEN} Task completed! Reward: {task_reward}{Colors.RESET}')
     else:
         messages, task_done, task_reward, steps = run_standard_procedure(
             env, llm, model, messages, max_steps
@@ -202,6 +225,8 @@ def webshop_run_single(env, ob, instruction_text, max_steps=30, model=None, Skil
             if Skill_Module and Skill_Module.last_compilation is not None
             else None
         ),
+        "runtime_recompile_count": getattr(Skill_Module, "runtime_recompile_count", 0) if Skill_Module else 0,
+        "runtime_recompile_events": getattr(Skill_Module, "runtime_recompile_events", []) if Skill_Module else [],
     })
     
     return results

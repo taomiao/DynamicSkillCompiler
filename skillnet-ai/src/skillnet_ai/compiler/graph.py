@@ -24,7 +24,10 @@ ACTION_DRIVER_KEYWORDS = frozenset(
     {
         "activate",
         "build",
+        "buy",
         "clean",
+        "choose",
+        "click",
         "close",
         "connect",
         "cool",
@@ -41,8 +44,11 @@ ACTION_DRIVER_KEYWORDS = frozenset(
         "plant",
         "pour",
         "prepare",
+        "purchase",
         "put",
         "retrieve",
+        "search",
+        "select",
         "setup",
         "teleport",
         "transfer",
@@ -58,13 +64,16 @@ SUPPORT_KEYWORDS = frozenset(
         "confirm",
         "evaluat",
         "examine",
+        "filter",
         "focus",
         "identif",
         "inspect",
         "locat",
         "look",
         "monitor",
+        "analyz",
         "observ",
+        "rank",
         "read",
         "scan",
         "track",
@@ -407,6 +416,11 @@ class SkillGraphCompiler:
     similar_prune_margin: float = 0.08
     keep_parent_if_better_by: float = 0.05
     pass_sequence: Tuple[str, ...] = DEFAULT_GRAPH_PASSES
+    max_selected_skills: int = 0
+    max_support_skills: int = 0
+    action_driver_bonus: float = 0.0
+    support_skill_penalty: float = 0.0
+    coverage_floor: float = 0.0
 
     def compile(
         self,
@@ -419,7 +433,14 @@ class SkillGraphCompiler:
         subgoals = subgoals or []
         matched_fragments = matched_fragments or {}
         scores = {
-            skill_id: self.scorer.score(skill, query_plan)
+            skill_id: min(
+                1.5,
+                max(
+                    0.0,
+                    self.scorer.score(skill, query_plan)
+                    + self._selection_bias(skill, query_plan, environment),
+                ),
+            )
             for skill_id, skill in graph.skills.items()
         }
         ranked = sorted(scores, key=lambda skill_id: scores[skill_id], reverse=True)
@@ -538,6 +559,16 @@ class SkillGraphCompiler:
             )
 
         selected |= protected
+        selected = self._enforce_selection_budget(
+            graph,
+            selected,
+            scores,
+            dropped,
+            protected,
+            query_plan,
+            subgoals,
+            subgoal_matches,
+        )
         if not selected and ranked:
             selected.add(ranked[0])
             dropped.pop(ranked[0], None)
@@ -611,6 +642,17 @@ class SkillGraphCompiler:
         ]
         if pass_sequence != DEFAULT_GRAPH_PASSES:
             notes.append("Graph compiler pass sequence was overridden by config.")
+        if self.max_selected_skills > 0 or self.max_support_skills > 0:
+            notes.append(
+                "Selection budget constrained the compiled skill package "
+                f"(max_selected={self.max_selected_skills or 'unbounded'}, "
+                f"max_support={self.max_support_skills or 'unbounded'})."
+            )
+        if self.coverage_floor > 0:
+            notes.append(
+                "Coverage-aware pruning preserved a minimum retained task coverage "
+                f"(coverage_floor={self.coverage_floor:.2f})."
+            )
         return CompiledSkillPackage(
             query_plan=query_plan,
             subgoals=subgoals,
@@ -868,6 +910,15 @@ class SkillGraphCompiler:
                 continue
             if self._is_dependency_anchor(graph, retained, loser):
                 continue
+            if self._violates_coverage_floor(
+                graph,
+                retained,
+                loser,
+                query_plan,
+                subgoals,
+                subgoal_matches,
+            ):
+                continue
             if loser in retained:
                 retained.remove(loser)
                 dropped[loser] = f"dominated_by_similar_skill:{winner}"
@@ -903,6 +954,15 @@ class SkillGraphCompiler:
             ):
                 continue
             if self._is_dependency_anchor(graph, retained, parent):
+                continue
+            if self._violates_coverage_floor(
+                graph,
+                retained,
+                parent,
+                query_plan,
+                subgoals,
+                subgoal_matches,
+            ):
                 continue
             if child in retained and parent in retained:
                 retained.remove(parent)
@@ -977,6 +1037,15 @@ class SkillGraphCompiler:
                 other_required = self._selected_capabilities(graph, others) & required_pool
                 skill_required = graph.skills[skill_id].normalized_capabilities() & required_pool
                 if skill_required - other_required:
+                    continue
+                if self._violates_coverage_floor(
+                    graph,
+                    retained,
+                    skill_id,
+                    query_plan,
+                    subgoals,
+                    subgoal_matches,
+                ):
                     continue
 
                 retained.remove(skill_id)
@@ -1071,6 +1140,15 @@ class SkillGraphCompiler:
                     subgoal_matches,
                 ):
                     continue
+                if self._violates_coverage_floor(
+                    graph,
+                    retained,
+                    skill_id,
+                    query_plan,
+                    subgoals,
+                    subgoal_matches,
+                ):
+                    continue
 
                 retained.remove(skill_id)
                 dropped[skill_id] = "topic_drift_low_anchor_overlap"
@@ -1137,6 +1215,15 @@ class SkillGraphCompiler:
                 ):
                     continue
                 if scores[skill_id] >= max(0.45, self.min_relevance + 0.12):
+                    continue
+                if self._violates_coverage_floor(
+                    graph,
+                    retained,
+                    skill_id,
+                    query_plan,
+                    subgoals,
+                    subgoal_matches,
+                ):
                     continue
                 retained.remove(skill_id)
                 dropped[skill_id] = "low_marginal_contribution"
@@ -1292,10 +1379,30 @@ class SkillGraphCompiler:
             return 0.0
         profile = self._skill_role_profile(skill)
         if profile["driver_score"] > profile["support_score"]:
-            return 0.06
+            return max(0.06, self.action_driver_bonus)
         if profile["driver_score"] == 0 and profile["support_score"] > 0:
-            return -0.04
+            return -max(0.04, self.support_skill_penalty)
         return 0.0
+
+    def _selection_bias(
+        self,
+        skill: SkillAsset,
+        query_plan: QueryPlan,
+        environment: LocalEnvironment,
+    ) -> float:
+        profile = self._skill_role_profile(skill)
+        bias = 0.0
+        if profile["driver_score"] > profile["support_score"]:
+            bias += self.action_driver_bonus
+        elif profile["driver_score"] == 0 and (
+            profile["support_score"] > 0 or profile["is_verifier"] or profile["is_monitor"]
+        ):
+            bias -= self.support_skill_penalty
+
+        if self._is_search_ui_query(query_plan, environment) and profile["driver_score"] == 0:
+            if profile["support_score"] > 0 or profile["is_verifier"] or profile["is_monitor"]:
+                bias -= self.support_skill_penalty * 0.5
+        return bias
 
     def _topic_alignment_bias(
         self,
@@ -1353,6 +1460,45 @@ class SkillGraphCompiler:
             len(capability_signals & structural_terms) >= 3
         )
         return multi_phase and structure_heavy
+
+    def _is_search_ui_query(
+        self,
+        query_plan: QueryPlan,
+        environment: LocalEnvironment,
+    ) -> bool:
+        raw_query = query_plan.raw_query.lower()
+        markers = (
+            "instruction:",
+            "price lower than",
+            "under ",
+            "dollars",
+            "less than",
+            "color:",
+            "size:",
+            "product",
+            "search",
+            "buy",
+            "purchase",
+        )
+        token_pool = set(query_plan.required_capabilities) | set(query_plan.optional_capabilities)
+        search_token_hits = len(
+            token_pool
+            & {
+                "buy",
+                "purchas",
+                "search",
+                "product",
+                "price",
+                "size",
+                "color",
+                "variant",
+                "option",
+                "checkout",
+                "page",
+            }
+        )
+        marker_hits = sum(1 for marker in markers if marker in raw_query)
+        return marker_hits >= 2 or (marker_hits >= 1 and search_token_hits >= 2) or search_token_hits >= 3
 
     def _skill_role_profile(self, skill: SkillAsset) -> Dict[str, object]:
         text = " ".join(
@@ -1481,6 +1627,16 @@ class SkillGraphCompiler:
                 return True
         return False
 
+    def _support_skill_ids(self, graph: SkillGraph, selected: Set[str]) -> Set[str]:
+        support_ids: Set[str] = set()
+        for skill_id in selected:
+            profile = self._skill_role_profile(graph.skills[skill_id])
+            if profile["driver_score"] == 0 and (
+                profile["support_score"] > 0 or profile["is_verifier"] or profile["is_monitor"] or profile["is_focus"]
+            ):
+                support_ids.add(skill_id)
+        return support_ids
+
     def _has_stronger_aligned_peer(
         self,
         graph: SkillGraph,
@@ -1558,6 +1714,134 @@ class SkillGraphCompiler:
         skill_required = graph.skills[skill_id].normalized_capabilities() & required_pool
         other_required = self._selected_capabilities(graph, others) & required_pool
         return bool(skill_required - other_required)
+
+    def _selection_coverage_score(
+        self,
+        graph: SkillGraph,
+        selected: Set[str],
+        query_plan: QueryPlan,
+        subgoals: List[Subgoal],
+        subgoal_matches: Dict[str, Dict[str, float]],
+    ) -> float:
+        return self._coverage_score(
+            query_plan=query_plan,
+            subgoals=subgoals,
+            covered_subgoals=self._selected_subgoals(selected, subgoal_matches),
+            selected_capabilities=self._selected_capabilities(graph, selected),
+        )
+
+    def _violates_coverage_floor(
+        self,
+        graph: SkillGraph,
+        selected: Set[str],
+        candidate: str,
+        query_plan: QueryPlan,
+        subgoals: List[Subgoal],
+        subgoal_matches: Dict[str, Dict[str, float]],
+    ) -> bool:
+        if candidate not in selected:
+            return False
+        if self.coverage_floor <= 0:
+            return False
+        retained = set(selected)
+        before_score = self._selection_coverage_score(
+            graph,
+            retained,
+            query_plan,
+            subgoals,
+            subgoal_matches,
+        )
+        retained.discard(candidate)
+        after_score = self._selection_coverage_score(
+            graph,
+            retained,
+            query_plan,
+            subgoals,
+            subgoal_matches,
+        )
+        threshold = min(before_score, self.coverage_floor)
+        return after_score + 1e-9 < threshold
+
+    def _enforce_selection_budget(
+        self,
+        graph: SkillGraph,
+        selected: Set[str],
+        scores: Dict[str, float],
+        dropped: Dict[str, str],
+        protected: Set[str],
+        query_plan: QueryPlan,
+        subgoals: List[Subgoal],
+        subgoal_matches: Dict[str, Dict[str, float]],
+    ) -> Set[str]:
+        if self.max_selected_skills <= 0 and self.max_support_skills <= 0:
+            return set(selected)
+
+        retained = set(selected)
+        required_pool = self._required_capability_pool(query_plan, subgoals)
+        changed = True
+        while changed:
+            changed = False
+            support_ids = self._support_skill_ids(graph, retained)
+            over_total = self.max_selected_skills > 0 and len(retained) > self.max_selected_skills
+            over_support = self.max_support_skills > 0 and len(support_ids) > self.max_support_skills
+            if not over_total and not over_support:
+                break
+
+            candidates = sorted(
+                retained,
+                key=lambda item: (
+                    0 if over_support and item in support_ids else 1,
+                    int(item in protected),
+                    int(self._skill_role_profile(graph.skills[item])["driver_score"] > 0),
+                    scores[item],
+                ),
+            )
+            covered_subgoals = self._selected_subgoals(retained, subgoal_matches)
+            covered_required = self._selected_capabilities(graph, retained) & required_pool
+            for skill_id in candidates:
+                if skill_id in protected or len(retained) <= 1:
+                    continue
+                if over_support and skill_id not in support_ids and not over_total:
+                    continue
+                if self._is_dependency_anchor(graph, retained, skill_id):
+                    continue
+                if self._is_compositional_support(graph, retained, skill_id, query_plan):
+                    continue
+                if self._has_unique_contribution(
+                    graph,
+                    skill_id,
+                    retained,
+                    query_plan,
+                    subgoals,
+                    subgoal_matches,
+                ):
+                    continue
+
+                others = retained - {skill_id}
+                skill_subgoals = self._covered_subgoals(skill_id, subgoal_matches)
+                other_subgoals = self._selected_subgoals(others, subgoal_matches)
+                other_required = self._selected_capabilities(graph, others) & required_pool
+                if skill_subgoals and other_subgoals != covered_subgoals:
+                    continue
+                if required_pool and other_required != covered_required:
+                    continue
+                if self._violates_coverage_floor(
+                    graph,
+                    retained,
+                    skill_id,
+                    query_plan,
+                    subgoals,
+                    subgoal_matches,
+                ):
+                    continue
+
+                retained.remove(skill_id)
+                dropped[skill_id] = (
+                    "support_budget_exceeded" if skill_id in support_ids else "selection_budget_exceeded"
+                )
+                changed = True
+                break
+        return retained
 
     def _coverage_score(
         self,

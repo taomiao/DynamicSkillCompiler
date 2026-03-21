@@ -25,6 +25,7 @@ from skillnet_ai.compiler import (
     LocalEnvironment,
     LocalSkillLibraryRetriever,
     QueryOptimizer,
+    TaskDecomposer,
 )
 
 
@@ -49,6 +50,35 @@ class SkillModule:
         self.compiler_latency_weight = kwargs.get("compiler_latency_weight", 0.10)
         self.compiler_top_k = kwargs.get("compiler_top_k", 6)
         self.compiler_max_skill_chars = kwargs.get("compiler_max_skill_chars", 1200)
+        self.compiler_max_selected_skills = kwargs.get("compiler_max_selected_skills", 0)
+        self.compiler_max_support_skills = kwargs.get("compiler_max_support_skills", 0)
+        self.compiler_action_driver_bonus = kwargs.get("compiler_action_driver_bonus", 0.0)
+        self.compiler_support_skill_penalty = kwargs.get("compiler_support_skill_penalty", 0.0)
+        self.compiler_coverage_floor = kwargs.get("compiler_coverage_floor", 0.0)
+        self.runtime_recompile_enabled = kwargs.get(
+            "runtime_recompile_enabled",
+            self.selection_strategy == "dsc",
+        )
+        self.runtime_recompile_max_count = kwargs.get("runtime_recompile_max_count", 1)
+        self.runtime_recompile_min_interval_steps = kwargs.get("runtime_recompile_min_interval_steps", 2)
+        self.runtime_recompile_stagnation_threshold = kwargs.get("runtime_recompile_stagnation_threshold", 2)
+        self.runtime_recompile_min_remaining_steps = kwargs.get("runtime_recompile_min_remaining_steps", 1)
+        self.runtime_recompile_reward_plateau_steps = kwargs.get(
+            "runtime_recompile_reward_plateau_steps",
+            5,
+        )
+        self.runtime_recompile_reward_plateau_min_progress = kwargs.get(
+            "runtime_recompile_reward_plateau_min_progress",
+            0.2,
+        )
+        self.runtime_recompile_high_progress_reward_threshold = kwargs.get(
+            "runtime_recompile_high_progress_reward_threshold",
+            0.7,
+        )
+        self.runtime_recompile_trace_tail = kwargs.get("runtime_recompile_trace_tail", 6)
+        self.runtime_recompile_count = 0
+        self.runtime_recompile_events = []
+        self.runtime_last_recompile_step = -999
         self.last_compilation = None
         self.last_candidate_assets = {}
         self.last_seed_skill_names = []
@@ -104,10 +134,11 @@ class SkillModule:
         print(f"[INFO] Loaded metadata for {len(metadata)} skills.")
         return metadata
     
-    def retrieve_relevant_skills(self, task):
+    def retrieve_relevant_skills(self, task, carryover_skill_names=None):
         """
         Retrieve relevant skills from metadata based on task description.
         """
+        carryover_skill_names = list(dict.fromkeys(list(carryover_skill_names or [])))
         if self.selection_strategy == "dsc":
             quality_reference_skill_names = (
                 self._llm_retrieve_relevant_skill_names(
@@ -130,7 +161,11 @@ class SkillModule:
             self.last_seed_skill_names = list(seed_skill_names or [])
             self.last_quality_reference_skill_names = list(quality_reference_skill_names or [])
             compile_seed_skill_names = list(
-                dict.fromkeys(list(seed_skill_names or []) + list(quality_reference_skill_names or []))
+                dict.fromkeys(
+                    list(seed_skill_names or [])
+                    + list(quality_reference_skill_names or [])
+                    + carryover_skill_names
+                )
             )
             self.last_compilation = self._compile_task(
                 task,
@@ -208,12 +243,27 @@ class SkillModule:
         if matchs:
             raw_content = matchs[-1]
             if "<Overall_Procedure_Code>" in raw_content: # handle nested tags
-                overall_procedure_code = raw_content.split("<Overall_Procedure_Code>")[-1]
-            overall_procedure_code = raw_content.strip().strip("```python").strip("```")
+                raw_content = raw_content.split("<Overall_Procedure_Code>")[-1]
+            overall_procedure_code = self._sanitize_generated_procedure_code(raw_content)
         else:
-            overall_procedure_code = ""
+            overall_procedure_code = self._sanitize_generated_procedure_code(response)
 
         return overall_procedure_code
+
+    def _sanitize_generated_procedure_code(self, raw_content):
+        if not raw_content:
+            return ""
+        code = str(raw_content).strip()
+        code = re.sub(r"^\s*```(?:python)?\s*", "", code, flags=re.IGNORECASE)
+        code = re.sub(r"\s*```\s*$", "", code)
+        if "<Overall_Procedure_Code>" in code:
+            code = code.split("<Overall_Procedure_Code>")[-1]
+        if "</Overall_Procedure_Code>" in code:
+            code = code.split("</Overall_Procedure_Code>")[0]
+        def_index = code.find("def overall_procedure_code")
+        if def_index >= 0:
+            code = code[def_index:]
+        return code.strip()
 
     def _compile_task(self, task, seed_skill_names=None):
         query_plan = QueryOptimizer().optimize(task)
@@ -246,6 +296,12 @@ class SkillModule:
                 quality_weight=self.compiler_quality_weight,
                 cost_weight=self.compiler_cost_weight,
                 latency_weight=self.compiler_latency_weight,
+                max_selected_skills=self.compiler_max_selected_skills,
+                max_support_skills=self.compiler_max_support_skills,
+                action_driver_bonus=self.compiler_action_driver_bonus,
+                support_skill_penalty=self.compiler_support_skill_penalty,
+                coverage_floor=self.compiler_coverage_floor,
+                compile_stage=self._current_compile_stage(task),
             ),
         )
         environment = LocalEnvironment(
@@ -265,67 +321,99 @@ class SkillModule:
             if skill_name not in available:
                 available.append(skill_name)
 
-        if self._infer_benchmark() != "scienceworld":
-            return available[: max(self.compiler_top_k, len(reference_skill_names))]
+        budget = self._quality_first_budget(task)
+        if self.last_compilation is not None:
+            compiled_order = [
+                item.asset.name
+                for item in self.last_compilation.compiled_skills
+                if item.asset.name in available
+            ]
+            remaining = [skill_name for skill_name in available if skill_name not in compiled_order]
+            available = compiled_order + remaining
+        if budget > 0:
+            return available[:budget]
+        return available
 
-        if self._is_scienceworld_conductivity_query(task):
-            canonical = self._select_scienceworld_conductivity_skill_names(available)
-            if canonical:
-                return canonical
-        if self._is_scienceworld_temperature_query(task):
-            canonical = self._select_scienceworld_temperature_skill_names(available)
-            if canonical:
-                return canonical
-        if self._is_scienceworld_growth_query(task):
-            canonical = self._select_scienceworld_growth_skill_names(available)
-            if canonical:
-                return canonical
+    def merge_runtime_recompile_skill_names(
+        self,
+        task,
+        previous_skill_names,
+        refreshed_skill_names,
+        decision=None,
+    ):
+        previous = list(dict.fromkeys(list(previous_skill_names or [])))
+        refreshed = list(dict.fromkeys(list(refreshed_skill_names or [])))
+        if not refreshed:
+            return previous
+        if not previous:
+            return refreshed
 
-        query = task.lower()
-        selected = []
+        effective = self._adaptive_compiler_config(task)
+        budget = self._quality_first_budget(task)
+        if effective.max_selected_skills > 0:
+            budget = max(1, effective.max_selected_skills)
+        preserve_previous = max(2, int(getattr(effective, "preserve_top_k", 2)))
 
-        def pick_first(candidates):
-            for candidate in candidates:
-                if candidate in available and candidate not in selected:
-                    selected.append(candidate)
-                    return
+        decision = decision or {}
+        if str(decision.get("reason", "")) in {"action_failure", "stagnation"}:
+            preserve_previous = max(preserve_previous, min(len(previous), 4))
+        if float(decision.get("task_reward", 0.0) or 0.0) > 0:
+            preserve_previous = max(preserve_previous, min(len(previous), 4))
+        if getattr(effective, "profile_name", "") == "workflow":
+            preserve_previous = max(preserve_previous, min(len(previous), 5))
 
-        if "located" in query or "find" in query or "around the" in query:
-            pick_first([
-                "scienceworld-object-locator",
-                "scienceworld-target-locator",
-                "scienceworld-room-navigator",
-                "scienceworld-room-explorer",
-            ])
+        merged = []
+        previous_kept = 0
 
-        if "focus on" in query:
-            pick_first([
-                "scienceworld-object-focuser",
-                "scienceworld-task-focuser",
-            ])
+        def add(skill_name):
+            nonlocal previous_kept
+            if not skill_name or skill_name in merged:
+                return
+            merged.append(skill_name)
+            if skill_name in previous:
+                previous_kept += 1
 
-        if "conductive" in query or "conductivity" in query:
-            pick_first([
-                "scienceworld-conductivity-tester",
-                "scienceworld-circuit-builder",
-                "scienceworld-circuit-connector",
-            ])
+        for skill_name in refreshed:
+            add(skill_name)
 
-        if "box" in query or "place" in query or "move" in query:
-            pick_first([
-                "scienceworld-object-classifier",
-                "scienceworld-conditional-placer",
-                "scienceworld-object-placer",
-                "scienceworld-container-relocator",
-            ])
-
-        for skill_name in available:
-            if skill_name not in selected:
-                selected.append(skill_name)
-            if len(selected) >= max(self.compiler_top_k, len(reference_skill_names)):
+        for skill_name in previous:
+            if previous_kept >= preserve_previous:
                 break
+            add(skill_name)
 
-        return selected
+        ordered_candidates = []
+        if self.last_compilation is not None:
+            for item in self.last_compilation.compiled_skills:
+                name = item.asset.name
+                if name in refreshed or name in previous:
+                    ordered_candidates.append(name)
+        for skill_name in refreshed + previous:
+            if skill_name not in ordered_candidates:
+                ordered_candidates.append(skill_name)
+        for skill_name in ordered_candidates:
+            add(skill_name)
+
+        budget = max(budget, len(refreshed), min(len(merged), preserve_previous + len(refreshed)))
+        if budget > 0 and len(merged) > budget:
+            priority = set(refreshed)
+            while len(merged) > budget:
+                drop_idx = None
+                preserved_previous = sum(1 for name in merged if name in previous)
+                for idx in range(len(merged) - 1, -1, -1):
+                    candidate = merged[idx]
+                    if candidate in priority:
+                        continue
+                    if candidate in previous and preserved_previous <= min(preserve_previous, len(previous)):
+                        continue
+                    drop_idx = idx
+                    break
+                if drop_idx is None:
+                    break
+                removed = merged.pop(drop_idx)
+                if removed in previous:
+                    preserved_previous -= 1
+
+        return merged
 
     def _select_scienceworld_conductivity_skill_names(self, available):
         selected = []
@@ -797,6 +885,128 @@ def overall_procedure_code(
         if "webshop" in path_text:
             return "webshop"
         return "generic"
+
+    def _current_compile_stage(self, task) -> str:
+        if self.runtime_recompile_count <= 0:
+            return "initial"
+        task_text = str(task or "")
+        if "[Runtime Recompile]" in task_text:
+            return "runtime_recompile"
+        return "runtime_recompile"
+
+    def _quality_first_budget(self, task) -> int:
+        effective = self._adaptive_compiler_config(task)
+        if effective.max_selected_skills > 0:
+            return max(1, effective.max_selected_skills)
+        return max(self.compiler_top_k, effective.preserve_top_k + 3, 1)
+
+    def _adaptive_compiler_config(self, task):
+        task_text = str(task or "")
+        query_plan = QueryOptimizer().optimize(task_text)
+        subgoals = TaskDecomposer().decompose(query_plan)
+        probe = DynamicSkillCompiler(
+            retriever=InMemorySkillRetriever([]),
+            config=CompilerConfig(
+                min_relevance=self.compiler_min_relevance,
+                preserve_top_k=self.compiler_preserve_top_k,
+                similar_prune_margin=self.compiler_similar_prune_margin,
+                keep_parent_if_better_by=self.compiler_keep_parent_if_better_by,
+                coverage_weight=self.compiler_coverage_weight,
+                quality_weight=self.compiler_quality_weight,
+                cost_weight=self.compiler_cost_weight,
+                latency_weight=self.compiler_latency_weight,
+                max_selected_skills=self.compiler_max_selected_skills,
+                max_support_skills=self.compiler_max_support_skills,
+                action_driver_bonus=self.compiler_action_driver_bonus,
+                support_skill_penalty=self.compiler_support_skill_penalty,
+                coverage_floor=self.compiler_coverage_floor,
+                compile_stage=self._current_compile_stage(task_text),
+            ),
+        )
+        environment = LocalEnvironment(
+            cwd=str(Path.cwd()),
+            workspace_root=str(self.skills_dir.resolve()),
+            python_bin=sys.executable or "python",
+            shell=os.environ.get("SHELL", "sh"),
+            os_name=sys.platform,
+            available_bins=set(),
+            benchmark=self._infer_benchmark(),
+        )
+        return probe._effective_config(query_plan, subgoals, environment)
+
+    def should_use_runtime_recompile(self) -> bool:
+        return self.selection_strategy == "dsc" and bool(self.runtime_recompile_enabled)
+
+    def can_runtime_recompile(self) -> bool:
+        if not self.should_use_runtime_recompile():
+            return False
+        return self.runtime_recompile_count < max(0, int(self.runtime_recompile_max_count))
+
+    def record_runtime_recompile(self, decision):
+        self.runtime_recompile_count += 1
+        if isinstance(decision, dict):
+            self.runtime_recompile_events.append(dict(decision))
+            self.runtime_last_recompile_step = int(decision.get("step_index", self.runtime_last_recompile_step))
+
+    def build_runtime_recompile_task(self, task_prompt, messages, decision, remaining_steps):
+        decision = decision or {}
+        effective = self._adaptive_compiler_config(task_prompt)
+        snapshot = decision.get("state_snapshot") or {}
+        recent_messages = []
+        for message in messages[-8:]:
+            role = message.get("role", "user")
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            normalized = re.sub(r"\s+", " ", content)
+            recent_messages.append(f"{role}: {normalized[:240]}")
+
+        state_lines = []
+        for key in (
+            "current_location",
+            "visible_entities",
+            "inventory",
+            "visited_locations",
+            "open_receptacles",
+            "completed_transfers",
+            "completed_transforms",
+        ):
+            value = snapshot.get(key)
+            if value:
+                state_lines.append(f"- {key}: {value}")
+
+        observation_text = str(decision.get("observation", "")).lower()
+        relaxation_hint = ""
+        if effective.profile_name == "search" or any(
+            marker in observation_text
+            for marker in ("no results", "not found", "no product", "0 results", "no matches")
+        ):
+            relaxation_hint = (
+                "If the current path looks over-constrained or retrieval-heavy, relax non-essential constraints "
+                "and recover the shortest path back to a directly actionable state.\n"
+            )
+        elif decision.get("reason") == "reward_plateau":
+            relaxation_hint = (
+                "The task has made partial progress but stopped improving. Preserve the completed scaffold, "
+                "focus on the missing final subgoals, and avoid restarting solved phases.\n"
+            )
+
+        return (
+            "[Runtime Recompile]\n"
+            "Select the smallest skill set that can make immediate progress from the current state.\n"
+            "Prefer action-driving skills. Add verification, pagination, detail, or support skills only if they are needed in the next few steps.\n"
+            "Prefer immediate next-step skills over future-stage skills.\n"
+            "Preserve previously useful scaffold skills unless the new failure clearly shows they are irrelevant.\n"
+            f"Inferred task profile: {effective.profile_name}\n"
+            f"{relaxation_hint}"
+            f"Original task:\n{task_prompt}\n\n"
+            f"Failure reason: {decision.get('reason', 'unknown')}\n"
+            f"Remaining steps: {remaining_steps}\n"
+            f"Current observation: {decision.get('observation', '')}\n"
+            f"Selected skills before failure: {decision.get('selected_skills_before', [])}\n"
+            f"State snapshot:\n" + ("\n".join(state_lines) if state_lines else "- none") + "\n\n"
+            "Recent trajectory:\n" + ("\n".join(recent_messages) if recent_messages else "- none")
+        )
 
     def _llm_retrieve_relevant_skill_names(self, task, max_skills, candidate_mode):
         response = get_llm_response(
