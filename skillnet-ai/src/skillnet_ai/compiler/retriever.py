@@ -146,7 +146,7 @@ class LocalSkillLibraryRetriever:
                 description=description,
                 source="local_library",
                 location=entry.path,
-                capabilities=self._extract_capabilities(entry.name, description),
+                capabilities=self._extract_capabilities(entry.name, description, instructions),
                 token_cost=self._estimate_token_cost(skill_md),
                 execution_cost=1.0,
                 latency_ms=50.0,
@@ -237,8 +237,8 @@ class LocalSkillLibraryRetriever:
                 break
         return merged
 
-    def _extract_capabilities(self, name: str, description: str) -> set[str]:
-        return _extract_capabilities(name, description)
+    def _extract_capabilities(self, name: str, description: str, instructions: List[str] | None = None) -> set[str]:
+        return _extract_capabilities_from_skill(name, description, instructions)
 
     def _estimate_token_cost(self, skill_md: str) -> float:
         try:
@@ -249,7 +249,53 @@ class LocalSkillLibraryRetriever:
         return max(1.0, len(content.split()) / 50.0)
 
 
+# Compound word expansions: maps a token found in skill text to additional capability tokens
+# that the QueryOptimizer would produce for the equivalent task phrase.
+#
+# Two categories:
+#   1. Compound split: "lifespan" (1 word in skill) → {"life","span"} (2 words in task query)
+#   2. Form canonicalization: "chemically" (skill) → {"chemistry"} (task query canonical form)
+#
+# All target tokens use the SAME normalization rules as QueryOptimizer.normalize_capability_token
+# so they will match task required_capabilities without extra transformation.
+_COMPOUND_SPLITS: dict[str, tuple[str, ...]] = {
+    # Compound splits (one skill word → multiple task words)
+    "lifespan": ("life", "span"),
+    "lifecycle": ("life", "cycle"),
+    "nonliving": ("non", "living"),
+    "nonrenewable": ("non", "renewable"),
+    # Chemistry variant forms → canonical "chemistry" (what QueryOptimizer produces from task)
+    "chemically": ("chemistry",),
+    "chemical": ("chemistry",),
+    "chemicals": ("chemistry",),
+    # Electrical variants → "electric"
+    "electrical": ("electric",),
+    "electricity": ("electric",),
+    # Comparative adjective stems → base form that task uses
+    "shortest": ("short",),
+    "longest": ("long",),
+    "smallest": ("small",),
+    "largest": ("large",),
+    "youngest": ("young",),
+    "oldest": ("old",),
+    # Growth/plant action forms
+    "planted": ("plant",),
+    "planting": ("plant",),
+    "growing": ("grow",),
+    "seeding": ("seed",),
+    # Paint-mixing variants
+    "mixing": ("mix",),
+    "mixture": ("mix",),
+    "mixed": ("mix",),
+}
+
+
 def _normalize_token(token: str) -> str:
+    """Normalize a single token using the same suffix rules as QueryOptimizer.
+
+    Keeping both normalizers in sync ensures that tokens extracted from skill text
+    will match the required_capabilities produced by QueryOptimizer for task queries.
+    """
     token = token.strip().lower()
     if len(token) <= 2 or token in GENERIC_CAPABILITY_STOPWORDS:
         return ""
@@ -260,19 +306,50 @@ def _normalize_token(token: str) -> str:
     return token if len(token) > 2 and token not in GENERIC_CAPABILITY_STOPWORDS else ""
 
 
+def _expand_compounds(token: str) -> list[str]:
+    """Return the token plus any component parts from the compound-split table."""
+    parts = _COMPOUND_SPLITS.get(token)
+    if parts:
+        return [token] + list(parts)
+    return [token]
+
+
 def _extract_capabilities(name: str, description: str) -> set[str]:
-    text = f"{name} {description}".lower().replace("-", " ").replace("_", " ")
+    return _extract_capabilities_from_skill(name, description, None)
+
+
+def _extract_capabilities_from_skill(
+    name: str,
+    description: str,
+    instructions: list[str] | None,
+) -> set[str]:
+    """Extract capability tokens from skill name, description, and optionally instruction body.
+
+    Using instruction text (up to the first 8 lines) broadens the vocabulary so that
+    task tokens that don't appear in the short description can still match the skill.
+    Compound words like 'lifespan' are split into parts ('life', 'span') so they match
+    task queries that spell them as separate words.
+    """
+    # Combine name + description + leading instruction lines for richer vocabulary.
+    instruction_excerpt = ""
+    if instructions:
+        instruction_excerpt = " ".join(instructions[:8])
+    text = f"{name} {description} {instruction_excerpt}".lower().replace("-", " ").replace("_", " ")
     raw_tokens = [
         token for token in re.split(r"[^a-z0-9]+", text)
         if token and not token.isdigit()
     ]
-    normalized_tokens = []
+
+    # Normalize tokens and expand compound words.
+    normalized_tokens: list[str] = []
     for token in raw_tokens:
-        normalized = _normalize_token(token)
-        if normalized:
-            normalized_tokens.append(normalized)
+        for expanded in _expand_compounds(token):
+            normalized = _normalize_token(expanded)
+            if normalized:
+                normalized_tokens.append(normalized)
 
     capabilities = set(normalized_tokens)
+    # Add adjacent bigrams for multi-word concept matching.
     for left, right in zip(normalized_tokens, normalized_tokens[1:]):
         if left != right:
             capabilities.add(f"{left}_{right}")

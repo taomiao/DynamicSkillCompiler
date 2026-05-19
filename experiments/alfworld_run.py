@@ -121,9 +121,10 @@ def run_standard_procedure(env, llm, model, process_ob, messages, max_steps):
         observation, task_reward, done, info = env.step(action_list)
 
         # 3. Process Observation
+        won = info.get("won", [task_reward]) if isinstance(info, dict) else [task_reward]
         observation, task_reward, task_done = (
             process_ob(observation[0]),
-            info["won"][0],
+            won[0] if won else task_reward,
             done[0]
         )
 
@@ -145,7 +146,7 @@ def _alfworld_step_adapter(action, result):
         "action": action_text,
         "observation": process_ob(observation[0]) if observation else "",
         "task_done": done[0] if done else False,
-        "task_reward": info["won"][0] if info and "won" in info else 0.0,
+        "task_reward": info.get("won", [0.0])[0] if isinstance(info, dict) and info.get("won") else 0.0,
     }
 
 

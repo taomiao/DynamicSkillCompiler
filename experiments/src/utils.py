@@ -21,10 +21,12 @@ def _get_retry_delay_seconds():
 
 def _get_client():
     global _CLIENT, _CLIENT_CONFIG
-    api_key = os.environ.get("API_KEY")
-    base_url = os.environ.get("BASE_URL")
+    api_key = os.environ.get("API_KEY") or os.environ.get("OPENAI_API_KEY")
+    base_url = os.environ.get("BASE_URL") or os.environ.get("OPENAI_BASE_URL")
     if not api_key or not base_url:
-        raise RuntimeError("API_KEY and BASE_URL must be set before calling the experiment LLM.")
+        raise RuntimeError(
+            "API_KEY and BASE_URL (or OPENAI_API_KEY and OPENAI_BASE_URL) must be set before calling the experiment LLM."
+        )
     client_config = (api_key, base_url, _get_timeout_seconds())
     if _CLIENT is None or _CLIENT_CONFIG != client_config:
         _CLIENT = OpenAI(
@@ -64,7 +66,10 @@ def chat_completion(messages, model="gpt-4o"):
 def get_llm_response(messages, is_string=False, model="gpt-4o"):
     response = chat_completion(messages=messages, model=model)
     if not hasattr(response, "error"):
-        ans = response.choices[0].message.content
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            raise RuntimeError("LLM returned no choices in response.")
+        ans = choices[0].message.content
         if is_string:
             return ans
         else:

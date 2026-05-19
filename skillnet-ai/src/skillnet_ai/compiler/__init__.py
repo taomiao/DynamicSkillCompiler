@@ -22,6 +22,7 @@ from skillnet_ai.compiler.graph import (
 )
 from skillnet_ai.compiler.grounding import EnvironmentGrounder
 from skillnet_ai.compiler.pipeline import CompilerConfig, DynamicSkillCompiler
+from skillnet_ai.compiler.semantic import SemanticSoftMatcher
 from skillnet_ai.compiler.query import QueryOptimizer
 from skillnet_ai.compiler.retriever import (
     CompositeSkillRetriever,
@@ -58,6 +59,7 @@ __all__ = [
     "SkillRetriever",
     "SLIM_GRAPH_PASSES",
     "Subgoal",
+    "SemanticSoftMatcher",
     "SUPPORTED_GRAPH_PASSES",
     "TaskDecomposer",
 ]

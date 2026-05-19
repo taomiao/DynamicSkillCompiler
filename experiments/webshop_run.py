@@ -339,15 +339,21 @@ def main(args):
                 except:
                     continue
 
-    # Filter tasks to run
+    # Filter tasks to run (preserve index order so task_offset / task_limit match session_ids order)
     for idx in range(num_games):
+        if args.idx_min is not None and idx < args.idx_min:
+            continue
+        if args.idx_max is not None and idx > args.idx_max:
+            continue
         if idx not in existing_files:
-            # tasks_to_run.append(idx)
             tasks_to_run[idx] = session_ids[idx]
 
+    ordered_pairs = list(tasks_to_run.items())
+    if args.task_offset is not None:
+        ordered_pairs = ordered_pairs[args.task_offset :]
     if args.task_limit is not None:
-        limited_items = list(tasks_to_run.items())[: args.task_limit]
-        tasks_to_run = dict(limited_items)
+        ordered_pairs = ordered_pairs[: args.task_limit]
+    tasks_to_run = dict(ordered_pairs)
 
     print(f"Already finished: {finished_games}, Remaining: {len(tasks_to_run)}")
 
@@ -424,6 +430,24 @@ if __name__ == '__main__':
     parser.add_argument('--compiler_latency_weight', type=float, default=0.10)
     parser.add_argument('--num_products', type=int, default=None)
     parser.add_argument('--task_limit', type=int, default=None)
+    parser.add_argument(
+        '--task_offset',
+        type=int,
+        default=None,
+        help='Slice remaining tasks by order (negative = from end), e.g. -20 with --task_limit 20 for last 20',
+    )
     parser.add_argument('--filter_invalid_sessions', action='store_true')
+    parser.add_argument(
+        '--idx_min',
+        type=int,
+        default=None,
+        help='Only consider session indices >= this (inclusive); use with --idx_max to resume a slice',
+    )
+    parser.add_argument(
+        '--idx_max',
+        type=int,
+        default=None,
+        help='Only consider session indices <= this (inclusive)',
+    )
     args = parser.parse_args()
     main(args)

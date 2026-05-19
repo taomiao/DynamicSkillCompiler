@@ -85,10 +85,12 @@ def overall_procedure_code(
         #    - Convert env raw outputs into semantic signals
         #    - Do NOT modify this section
         # ============================================================
+        won = info.get("won", [reward]) if isinstance(info, dict) else [reward]
+        done_value = task_done[0] if isinstance(task_done, (list, tuple)) else bool(task_done)
         observation, reward, task_done = (
             process_ob(observation[0]),
-            info['won'][0],
-            task_done[0]
+            won[0] if won else reward,
+            done_value
         )
 
         print(f'\033[93mObservation: \n{observation}\033[0m')

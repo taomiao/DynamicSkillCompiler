@@ -383,12 +383,24 @@ class SkillUtilityScorer:
     quality_weight: float = 0.20
     cost_weight: float = 0.15
     latency_weight: float = 0.10
+    # Optional semantic soft-matcher.  When provided, _coverage() uses soft
+    # cosine-similarity matching instead of pure set intersection for the
+    # required_hit term.  Falls back to exact matching when None.
+    soft_matcher: object = None  # SemanticSoftMatcher | None
 
     def score(self, skill: SkillAsset, query_plan: QueryPlan) -> float:
         skill_caps = skill.normalized_capabilities()
         required = query_plan.required_capabilities
         optional = query_plan.optional_capabilities
         coverage = self._coverage(skill_caps, required, optional)
+        # Semantic bonus: description-level cosine similarity boosts coverage for
+        # skills that are semantically relevant but lexically mismatched (e.g. "hot"
+        # task and "heat-object" skill).  Falls back to 0 if no matcher is injected.
+        if self.soft_matcher is not None and query_plan.keyword_query:
+            semantic_bonus = self.soft_matcher.score_bonus(
+                query_plan.keyword_query, skill
+            )
+            coverage = min(1.0, coverage + semantic_bonus)
         quality = skill.mean_quality()
         cost = 1.0 / (1.0 + skill.token_cost + skill.execution_cost)
         latency = 1.0 / (1.0 + skill.latency_ms / 1000.0)
@@ -1183,6 +1195,18 @@ class SkillGraphCompiler:
         retained = set(selected)
         all_subgoal_ids = {subgoal.subgoal_id for subgoal in subgoals}
         required_pool = self._required_capability_pool(query_plan, subgoals)
+
+        # Safety guard: when vocabulary mismatch causes all subgoal_matches to be empty,
+        # the normal pruning logic removes nearly everything because every skill appears to
+        # have zero unique subgoal contribution.  In that case protect the top-k highest
+        # scoring skills so the compiler doesn't collapse to a single fallback skill.
+        total_subgoal_hits = sum(len(v) for v in subgoal_matches.values())
+        if total_subgoal_hits == 0 and retained:
+            floor_k = max(self.preserve_top_k, 3)
+            score_floor = sorted(scores.get(s, 0.0) for s in retained)
+            score_floor = score_floor[-floor_k] if len(score_floor) >= floor_k else score_floor[0]
+            protected = protected | {s for s in retained if scores.get(s, 0.0) >= score_floor}
+
         changed = True
         while changed:
             changed = False
@@ -1915,23 +1939,41 @@ class SkillGraphCompiler:
         environment: LocalEnvironment,
         fragments: List[SkillFragment],
     ) -> List[str]:
-        localized: List[str] = []
-        actionable_fragments = [
-            fragment.content
-            for fragment in fragments
-            if fragment.example_actions or len(fragment.content.split()) >= 4
-        ]
-        source_instructions = skill.instructions or [skill.description]
-        merged_instructions = list(dict.fromkeys(source_instructions + actionable_fragments))
-        source_instructions = merged_instructions or source_instructions
-        for instruction in source_instructions:
-            line = instruction.replace("{cwd}", environment.cwd)
+        def _substitute(line: str) -> str:
+            line = line.replace("{cwd}", environment.cwd)
             line = line.replace("{workspace_root}", environment.workspace_root)
             line = line.replace("python ", f"{environment.python_bin} ")
             if "~/workspace" in line:
                 line = line.replace("~/workspace", environment.workspace_root)
-            localized.append(line)
-        return localized
+            return line
+
+        # Prioritise fragments that contain concrete action examples — these are the most
+        # immediately useful hints for the procedure generator.
+        action_fragment_lines = [
+            _substitute(fragment.content)
+            for fragment in fragments
+            if fragment.example_actions
+        ]
+        # Secondary: fragments without explicit actions but substantial content.
+        support_fragment_lines = [
+            _substitute(fragment.content)
+            for fragment in fragments
+            if not fragment.example_actions and len(fragment.content.split()) >= 4
+        ]
+
+        source_instructions = skill.instructions or [skill.description]
+        base_lines = [_substitute(instr) for instr in source_instructions]
+
+        # Merge: action-bearing fragments first, then support fragments, then source body.
+        # Deduplicate while preserving insertion order.
+        seen: set[str] = set()
+        merged: List[str] = []
+        for line in action_fragment_lines + support_fragment_lines + base_lines:
+            if line not in seen:
+                seen.add(line)
+                merged.append(line)
+
+        return merged
 
     def _assigned_subgoals(
         self,

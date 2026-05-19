@@ -79,7 +79,8 @@ def overall_procedure_code(
         #      derived from env.step() outputs. DO NOT INFER.
         # ============================================================
         observation, step_reward, task_done, info = env.step(action)
-        task_reward = info['score'] if info['score'] is not None and info['score'] > task_reward else task_reward
+        score = info.get("score", task_reward) if isinstance(info, dict) else task_reward
+        task_reward = score if score is not None and score > task_reward else task_reward
 
         print(f'\033[93mObservation: \n{observation}\033[0m')
 

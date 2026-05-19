@@ -6,11 +6,7 @@ from typing import List
 from skillnet_ai.compiler.models import LocalEnvironment, SkillFragment, Subgoal
 
 
-DOMAIN_ACTIONS = {
-    "alfworld": {"go to", "take", "move", "open", "close", "use", "clean", "heat", "cool"},
-    "scienceworld": {"focus on", "open", "close", "activate", "pour", "mix", "measure", "use"},
-    "webshop": {"search", "click", "select", "buy now", "add to cart", "filter", "sort"},
-}
+DOMAIN_ACTIONS = {}
 
 
 @dataclass

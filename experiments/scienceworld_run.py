@@ -10,6 +10,10 @@ import importlib.util
 from pathlib import Path
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
+from src.repo_dotenv import load_repo_dotenv
+
+load_repo_dotenv(current_dir)
+
 scienceworld_candidates = [
     os.path.join(current_dir, "ScienceWorld"),
     os.path.join(current_dir, "scienceworld"),
@@ -109,6 +113,54 @@ def _resolve_ambiguous_action(action: str, last_observation: str) -> str:
     return action
 
 
+def _scienceworld_strip_parenthetical_objects(action: str) -> str:
+    """
+    ScienceWorld often rejects actions that copy parenthetical text from observations
+    (e.g. 'pick up tin cup (containing red paint)'). Strip those qualifiers for common verbs.
+    """
+    s = (action or "").strip()
+    if "(" not in s:
+        return s
+
+    def _strip_obj(chunk: str) -> str:
+        return re.sub(r"\s+", " ", _strip_instance_details(chunk).strip())
+
+    m = re.match(
+        r"^(pick up|focus on|examine|open|look at|read|activate|deactivate|mix)\s+(.+)$",
+        s,
+        re.IGNORECASE,
+    )
+    if m:
+        verb, obj = m.groups()
+        return f"{verb.lower()} {_strip_obj(obj)}"
+
+    m = re.match(r"^(pour)\s+(.+?)\s+(into)\s+(.+)$", s, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).lower()} {_strip_obj(m.group(2))} {m.group(3).lower()} {_strip_obj(m.group(4))}"
+
+    m = re.match(r"^(move)\s+(.+?)\s+(to)\s+(.+)$", s, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).lower()} {_strip_obj(m.group(2))} {m.group(3).lower()} {_strip_obj(m.group(4))}"
+
+    m = re.match(r"^(connect)\s+(.+?)\s+(to)\s+(.+)$", s, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).lower()} {_strip_obj(m.group(2))} {m.group(3).lower()} {_strip_obj(m.group(4))}"
+
+    m = re.match(r"^(disconnect)\s+(.+)$", s, re.IGNORECASE)
+    if m:
+        return f"{m.group(1).lower()} {_strip_obj(m.group(2))}"
+
+    m = re.match(r"^(use)\s+(.+)$", s, re.IGNORECASE)
+    if m:
+        rest = m.group(2)
+        if " on " in rest.lower():
+            left, _, right = re.split(r"\s+on\s+", rest, maxsplit=1, flags=re.IGNORECASE)
+            return f"use {_strip_obj(left)} on {_strip_obj(right)}"
+        return f"use {_strip_obj(rest)}"
+
+    return s
+
+
 def _normalize_indexed_object_guess(action: str, last_observation: str) -> str:
     text = last_observation.strip()
     if text.startswith("Observation:"):
@@ -144,6 +196,9 @@ def parse_action(response: str, last_observation: str = "") -> str:
         stripped = response.strip().strip('"\'*`')
         action = stripped if re.fullmatch(r"\d+", stripped) else ""
     action = _normalize_indexed_object_guess(action, last_observation)
+    obs = last_observation or ""
+    if "Ambiguous request" not in obs and "Please enter the number" not in obs:
+        action = _scienceworld_strip_parenthetical_objects(action)
     return _resolve_ambiguous_action(action, last_observation)
 
 
@@ -173,6 +228,27 @@ def update_task_status(output_path, idx, task_name, var_idx, stage, extra=None):
 
 class TaskTimedOutError(TimeoutError):
     pass
+
+
+SCIENCEWORLD_FULL_REWARD = 100
+
+
+class ScienceWorldFullRewardDoneWrapper:
+    """Keep ScienceWorld tasks running when the environment reports partial completion."""
+
+    def __init__(self, env, full_reward=SCIENCEWORLD_FULL_REWARD):
+        self._env = env
+        self.full_reward = full_reward
+
+    def step(self, action):
+        observation, step_reward, task_done, info = self._env.step(action)
+        score = info.get("score") if isinstance(info, dict) else None
+        if task_done and score is not None and score < self.full_reward:
+            task_done = False
+        return observation, step_reward, task_done, info
+
+    def __getattr__(self, name):
+        return getattr(self._env, name)
 
 
 _TASK_DEADLINE = None
@@ -223,7 +299,8 @@ def run_standard_procedure(env, llm, model, messages, max_steps):
         ensure_task_not_timed_out()
         observation, step_reward, task_done, info = env.step(action)
 
-        task_reward = info['score'] if info['score'] is not None and info['score'] > task_reward else task_reward
+        score = info.get("score", task_reward) if isinstance(info, dict) else task_reward
+        task_reward = score if score is not None and score > task_reward else task_reward
 
         print(f'{Colors.YELLOW}Observation: \n{observation}{Colors.RESET}')
 
@@ -270,6 +347,7 @@ def scienceworld_run_single(env, task_name, var_idx, args, Skill_Module=None, pr
     # ScienceWorld reset returns (observation, info)
     ensure_task_not_timed_out()
     obs, info = env.reset()
+    execution_env = ScienceWorldFullRewardDoneWrapper(env)
     
     # Construct Task Description
     query = env.get_task_description()
@@ -307,7 +385,7 @@ def scienceworld_run_single(env, task_name, var_idx, args, Skill_Module=None, pr
     if use_skill:
         ensure_task_not_timed_out()
         compiled_result = execute_compiled_procedure(
-            env=env,
+            env=execution_env,
             llm=llm,
             model=args.model,
             task_prompt=query,
@@ -338,7 +416,7 @@ def scienceworld_run_single(env, task_name, var_idx, args, Skill_Module=None, pr
         if progress_callback:
             progress_callback("running_standard_procedure")
         messages, task_done, task_reward, steps = run_standard_procedure(
-            env, llm, args.model, messages, args.max_steps
+            execution_env, llm, args.model, messages, args.max_steps
         )
 
     if progress_callback:
@@ -425,6 +503,17 @@ def eval_single_variation(idx, indices, args, output_path):
                 "compiler_quality_weight": args.compiler_quality_weight,
                 "compiler_cost_weight": args.compiler_cost_weight,
                 "compiler_latency_weight": args.compiler_latency_weight,
+                "dsc_procedure_refiner_enabled": bool(
+                    getattr(args, "dsc_procedure_refiner", False)
+                ),
+                "dsc_procedure_refiner_model": getattr(
+                    args, "dsc_procedure_refiner_model", None
+                ),
+                "dsc_procedure_refiner_mode": (
+                    "replace"
+                    if getattr(args, "dsc_procedure_refiner_replace", False)
+                    else getattr(args, "dsc_procedure_refiner_mode", None)
+                ),
             }
             Skill_Module = SkillModule(**skill_config)
             progress_callback("skill_module_ready")
@@ -509,20 +598,31 @@ def main(args):
                 try:
                     idx = int(file.split('_')[1].split('.')[0])
                     existing_files.add(idx)
-                    
-                    with open(f'{output_path}/{file}', 'r') as f:
-                        res = json.load(f)
-                        all_rewards += res['reward']
-                        all_steps += res['steps']
-                    finished_games += 1
-                except:
+                    in_slice = True
+                    if args.idx_min is not None and idx < args.idx_min:
+                        in_slice = False
+                    if args.idx_max is not None and idx > args.idx_max:
+                        in_slice = False
+                    if in_slice:
+                        with open(f'{output_path}/{file}', 'r') as f:
+                            res = json.load(f)
+                            all_rewards += res['reward']
+                            all_steps += res['steps']
+                        finished_games += 1
+                except Exception:
                     continue
 
     # Filter tasks to run
     for idx in range(num_games):
+        if args.idx_min is not None and idx < args.idx_min:
+            continue
+        if args.idx_max is not None and idx > args.idx_max:
+            continue
         if idx not in existing_files:
             tasks_to_run.append(idx)
 
+    if args.task_offset is not None:
+        tasks_to_run = tasks_to_run[args.task_offset:]
     if args.task_limit is not None:
         tasks_to_run = tasks_to_run[: args.task_limit]
 
@@ -607,10 +707,49 @@ def build_arg_parser():
     parser.add_argument('--compiler_cost_weight', type=float, default=0.15)
     parser.add_argument('--compiler_latency_weight', type=float, default=0.10)
     parser.add_argument('--task_limit', type=int, default=None)
+    parser.add_argument('--task_offset', type=int, default=None, help='Start from this index in tasks_to_run (negative means from end, e.g. -20 for last 20)')
+    parser.add_argument(
+        '--idx_min',
+        type=int,
+        default=None,
+        help='Only consider session indices >= this (inclusive); use with --idx_max for a fixed slice',
+    )
+    parser.add_argument(
+        '--idx_max',
+        type=int,
+        default=None,
+        help='Only consider session indices <= this (inclusive)',
+    )
     parser.add_argument('--llm_timeout', type=float, default=90.0)
     parser.add_argument('--llm_retry_attempts', type=int, default=3)
     parser.add_argument('--llm_retry_delay', type=float, default=3.0)
     parser.add_argument('--task_timeout', type=int, default=0)
+    parser.add_argument(
+        '--dsc_procedure_refiner',
+        action='store_true',
+        help=(
+            'DSC only: second LLM pass after the first procedure (DSC_PROCEDURE_REFINER_MODEL). '
+            'Default mode is append-only (short addendum); use --dsc_procedure_refiner_replace for legacy full rewrite.'
+        ),
+    )
+    parser.add_argument(
+        '--dsc_procedure_refiner_model',
+        type=str,
+        default=None,
+        help='Model id for refinement pass (default: env DSC_PROCEDURE_REFINER_MODEL or claude-opus-4-20250514)',
+    )
+    parser.add_argument(
+        '--dsc_procedure_refiner_replace',
+        action='store_true',
+        help='Use legacy replace refiner (rewrites full procedure; often hurts scores). Default is append addendum.',
+    )
+    parser.add_argument(
+        '--dsc_procedure_refiner_mode',
+        type=str,
+        choices=('append', 'replace', 'off'),
+        default=None,
+        help='Refiner mode: append | replace | off (overrides env DSC_PROCEDURE_REFINER_MODE; replace flag wins if set)',
+    )
     return parser
 
 
@@ -635,4 +774,9 @@ if __name__ == '__main__':
     parser = build_arg_parser()
     args = parser.parse_args()
     configure_runtime(args)
-    _run_as_imported_module(args)
+    # ProcessPoolExecutor must pickle eval_single_variation; the dynamic import path
+    # (scienceworld_run_cli) breaks pickling. Use direct main() when parallel.
+    if args.max_workers > 1:
+        main(args)
+    else:
+        _run_as_imported_module(args)

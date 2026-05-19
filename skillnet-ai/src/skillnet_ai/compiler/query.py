@@ -26,7 +26,7 @@ INTENT_KEYWORDS: Dict[str, Set[str]] = {
     "retrieve": {"find", "search", "lookup", "query"},
     "transform": {
         "convert", "compile", "rewrite", "refactor", "optimize", "boil",
-        "melt", "freeze", "heat", "cool", "chang", "transform",
+        "melt", "freeze", "chang", "transform",
     },
     "evaluate": {
         "evaluate", "verify", "test", "benchmark", "compare", "measure",
@@ -45,11 +45,18 @@ CONSTRAINT_KEYWORDS = {
 SYNONYM_EXPANSIONS: Dict[str, Set[str]] = {
     "put": {"place", "placer", "move", "transfer"},
     "place": {"put", "placer", "move"},
-    "cool": {"cooler", "cooling", "temperature", "cold", "freeze"},
-    "heat": {"heater", "heating", "temperature", "warm", "boil", "melt"},
+    "cool": {"cooler", "cooling", "temperature", "cold"},
+    "heat": {"heater", "heating", "temperature", "warm"},
+    # "hot" / "cold" are state adjectives that must map to the corresponding
+    # action-skill vocabulary.
+    "hot": {"heat", "heater", "heating", "warm", "cook", "microwave"},
+    "cold": {"cool", "cooler", "cooling", "fridge", "freez"},
     "boil": {"heat", "vaporize", "phase", "state"},
     "melt": {"heat", "liquid", "phase", "state"},
     "freeze": {"cool", "solid", "phase", "state"},
+    # "clean" / "wash" are precondition verbs that should map to transform skills.
+    "clean": {"wash", "sink", "sinkbasin", "rinse"},
+    "wash": {"clean", "sink", "sinkbasin"},
     "pick": {"take", "picker", "retrieve", "retriever"},
     "buy": {"purchase", "checkout", "order"},
     "purchase": {"buy", "checkout", "order"},
@@ -60,6 +67,16 @@ SYNONYM_EXPANSIONS: Dict[str, Set[str]] = {
     "measure": {"monitor", "temperature", "threshold"},
     "container": {"pot", "beaker", "cup", "jar"},
     "monitor": {"observe", "check", "verify", "wait"},
+    # Chemistry/synthesis tasks require mixing; expand so mixture-creator scores correctly.
+    "chemistry": {"mix", "mixture", "react", "combine", "synthes"},
+    "create": {"mix", "produc", "synthes"},
+    # Lifespan comparison requires identification and ranking.
+    "lifespan": {"life", "span", "compar", "longest", "shortest", "identif"},
+    "life": {"lifespan", "span"},
+    "span": {"lifespan", "life"},
+    # Growth tasks require planting and monitoring.
+    "grow": {"plant", "seed", "growth", "sprout"},
+    "growth": {"grow", "plant", "seed", "sprout"},
 }
 
 PHRASE_CAPABILITY_RULES = (

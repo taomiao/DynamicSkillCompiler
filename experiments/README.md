@@ -125,3 +125,30 @@ python summarize_results.py \
   --json-out results/scienceworld/o4-mini/summary.json \
   --md-out results/scienceworld/o4-mini/summary.md
 ```
+
+### Step 4: EvoSkill-Style Skill Evolution Dry Run
+
+DSC can also mine failed trajectories and produce EvoSkill-style proposals for
+editing or creating skills. This is intentionally staged: it writes proposal
+artifacts, validation criteria, and patch plans without directly changing the
+official skill library.
+
+```bash
+python evolve_skills.py \
+  --result-dir results/webshop/o4-mini/ab_skillnet_vs_dsc20_1k_valid_20260316_skill_dsc \
+  --max-cases 10 \
+  --min-cases-per-proposal 2 \
+  --write-staging \
+  --staging-dir results/evolution_staging/webshop_smoke \
+  --overwrite
+```
+
+The output contains:
+
+- `proposals.json`: machine-readable failure cases and skill evolution proposals.
+- `proposals.md`: human-readable review summary.
+- `evo-*/PATCH_PLAN.md`: candidate edit plan and acceptance criteria.
+
+Recommended acceptance rule: compare current DSC against DSC plus the staged
+candidate on the listed validation cases, and only promote the skill change if
+reward improves without unacceptable token or regression cost.

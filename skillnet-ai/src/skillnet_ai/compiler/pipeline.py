@@ -49,6 +49,9 @@ class DynamicSkillCompiler:
     fragment_extractor: SkillFragmentExtractor = field(default_factory=SkillFragmentExtractor)
     fragment_matcher: FragmentMatcher = field(default_factory=FragmentMatcher)
     grounder: EnvironmentGrounder = field(default_factory=EnvironmentGrounder)
+    # Optional SemanticSoftMatcher.  When provided, capability scoring uses
+    # soft cosine-similarity matching instead of pure keyword intersection.
+    soft_matcher: object = None  # SemanticSoftMatcher | None
 
     def compile(
         self,
@@ -71,6 +74,7 @@ class DynamicSkillCompiler:
                 quality_weight=effective_config.quality_weight,
                 cost_weight=effective_config.cost_weight,
                 latency_weight=effective_config.latency_weight,
+                soft_matcher=self.soft_matcher,
             ),
             min_relevance=effective_config.min_relevance,
             preserve_top_k=effective_config.preserve_top_k,

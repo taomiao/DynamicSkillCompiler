@@ -22,17 +22,6 @@ LEADING_PHASE_MARKERS = {
     "until",
 }
 
-SCIENCEWORLD_HINT_TOKENS = {
-    "substance", "boil", "melt", "freeze", "heat", "cool", "temperature",
-    "thermometer", "conductivity", "measure", "focus", "contain", "apparatu",
-    "monit", "wait", "react", "liquid", "solid", "vapor", "combust",
-}
-ALFWORLD_HINT_TOKENS = {
-    "put", "take", "mov", "clean", "cool", "heat", "stoveburn", "garbagecan",
-    "drawer", "cabinet", "receptacle", "pan", "fridge", "microwave",
-}
-
-
 @dataclass
 class TaskDecomposer:
     optimizer: QueryOptimizer = field(default_factory=QueryOptimizer)
@@ -111,20 +100,7 @@ class TaskDecomposer:
         return [clause for clause in clauses if clause]
 
     def _infer_environment_hints(self, clause: str, capabilities: Set[str]) -> dict:
-        hints = {}
-        if any(token in clause for token in {"buy", "purchase", "price", "product"}):
-            hints["domain"] = "webshop"
-        elif capabilities & {"stoveburn", "garbagecan", "drawer", "cabinet", "pan"}:
-            hints["domain"] = "alfworld"
-        elif capabilities & SCIENCEWORLD_HINT_TOKENS:
-            hints["domain"] = "scienceworld"
-        elif capabilities & ALFWORLD_HINT_TOKENS or any(
-            token in clause for token in {"stoveburner", "garbagecan", "drawer", "cabinet"}
-        ):
-            hints["domain"] = "alfworld"
-        if "domain" not in hints and capabilities:
-            hints["domain"] = "generic"
-        return hints
+        return {"domain": "generic"} if capabilities else {}
 
     def _augment_required_capabilities(self, clause: str, tokens: Set[str]) -> Set[str]:
         augmented: Set[str] = set()

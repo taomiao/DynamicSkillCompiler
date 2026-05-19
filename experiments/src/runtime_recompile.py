@@ -60,6 +60,39 @@ AMBIGUOUS_MARKERS = (
     "please enter the number",
 )
 
+CAPACITY_MARKERS = (
+    "inventory is full",
+    "carrying too much",
+    "already carrying",
+    "already holding",
+    "hands are full",
+    "too many things",
+)
+
+SEARCH_EXHAUSTED_MARKERS = (
+    "no results",
+    "not found",
+    "no matches",
+    "0 results",
+    "there is no",
+    "you can't see any such thing",
+)
+
+WEBSHOP_NAV_TARGETS = {
+    "next",
+    ">",
+    "next >",
+    "prev",
+    "< prev",
+    "previous",
+    "back",
+    "back to results",
+    "< back",
+    "< back to results",
+    "back to search",
+    "< back to search",
+}
+
 ALFWORLD_VISIBLE_ENTITY_PATTERN = re.compile(r"\b(?:a|an) ([a-z]+(?: [a-z]+)*) (\d+)\b")
 ALFWORLD_ARRIVAL_PATTERN = re.compile(r"you arrive at ([^.]+)\.", re.IGNORECASE)
 ALFWORLD_PICKUP_PATTERN = re.compile(
@@ -72,6 +105,19 @@ ALFWORLD_MOVE_PATTERN = re.compile(
 )
 ALFWORLD_OPEN_PATTERN = re.compile(r"you open the ([^.]+)\.", re.IGNORECASE)
 ALFWORLD_CLOSE_PATTERN = re.compile(r"you close the ([^.]+)\.", re.IGNORECASE)
+WEBSHOP_ASIN_PATTERN = re.compile(r"\bB[0-9A-Z]{9}\b")
+PRICE_LIMIT_PATTERN = re.compile(
+    r"\b(?:price\s+)?(?:lower than|less than|under|below|at most|no more than)\s+\$?\s*([0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+ATTRIBUTE_PATTERN = re.compile(
+    r"\b(?:with\s+)?(color|colour|size|fit type|type|material|location|destination)\s*:\s*([^,.;\n]+)",
+    re.IGNORECASE,
+)
+SOFT_DESCRIPTOR_PATTERN = re.compile(
+    r"\b(?:for|with)\s+([a-z][a-z0-9 -]{2,40}?)\s+(?:with|and|,|\.|$)",
+    re.IGNORECASE,
+)
 
 
 def _normalize_text(text: str) -> str:
@@ -149,12 +195,242 @@ def _clean_action_phrase(text: str) -> str:
     return re.sub(r"\s+", " ", _strip_articles(_space_indexed_tokens(text))).strip().lower()
 
 
+def _normalize_webshop_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
+def _webshop_click_target(action_key: str) -> str:
+    match = re.match(r"^click\[(.*)\]$", action_key, re.IGNORECASE)
+    return _normalize_webshop_key(match.group(1)) if match else ""
+
+
+def _is_horizontal_exploration_action(action_key: str, benchmark: str = "generic") -> bool:
+    """Actions that expand the search space without verifying a specific candidate."""
+    key = _normalize_text(action_key)
+    if not key:
+        return False
+    if key.startswith("search["):
+        return True
+    if benchmark == "webshop":
+        target_key = _webshop_click_target(key)
+        return target_key in WEBSHOP_NAV_TARGETS
+    return key in {"look", "look around", "inventory"} or key.startswith(
+        ("go to ", "teleport ", "move to ")
+    )
+
+
+def _is_candidate_commit_action(action_key: str, benchmark: str = "generic") -> bool:
+    """Actions that inspect, select, transform, or otherwise verify a candidate."""
+    key = _normalize_text(action_key)
+    if not key:
+        return False
+    if benchmark == "webshop":
+        target_key = _webshop_click_target(key)
+        return bool(target_key and target_key not in WEBSHOP_NAV_TARGETS)
+    return key.startswith(
+        (
+            "examine ",
+            "look at ",
+            "open ",
+            "take ",
+            "pick up ",
+            "focus on ",
+            "activate ",
+            "deactivate ",
+            "use ",
+            "mix ",
+            "pour ",
+            "measure ",
+            "heat ",
+            "cool ",
+            "clean ",
+            "slice ",
+            "move ",
+            "put ",
+            "place ",
+        )
+    )
+
+
+def _snapshot_has_candidates(snapshot: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    candidate_keys = ("webshop_products", "visible_entities")
+    return any(bool(snapshot.get(key)) for key in candidate_keys)
+
+
+def _format_list(items: Sequence[Any], *, limit: int = 6) -> str:
+    cleaned = [str(item).strip() for item in items if str(item).strip()]
+    if not cleaned:
+        return "- none"
+    lines = [f"- {item}" for item in cleaned[:limit]]
+    if len(cleaned) > limit:
+        lines.append(f"- ... ({len(cleaned) - limit} more)")
+    return "\n".join(lines)
+
+
+def _infer_constraint_ledger(task: str) -> Dict[str, List[str]]:
+    """Extract a conservative, benchmark-neutral constraint ledger from the task text.
+
+    The ledger is intentionally lightweight: it only promotes explicit limits and
+    labeled attributes to hard constraints, while leaving fuzzy descriptors as
+    soft constraints. It is used as a runtime prompt scaffold, not as a parser of
+    record.
+    """
+    task_text = str(task or "")
+    hard: List[str] = []
+    soft: List[str] = []
+    unknown: List[str] = []
+
+    for match in PRICE_LIMIT_PATTERN.finditer(task_text):
+        hard.append(f"price/value limit <= {match.group(1)}")
+
+    for label, value in ATTRIBUTE_PATTERN.findall(task_text):
+        cleaned_label = re.sub(r"\s+", " ", label.lower()).strip()
+        cleaned_value = re.sub(r"\s+", " ", value).strip()
+        if cleaned_value:
+            hard.append(f"{cleaned_label}: {cleaned_value}")
+
+    # Preserve quoted/labeled exact identifiers without trying to understand the domain.
+    for quoted in re.findall(r"[\"'`“”‘’]([^\"'`“”‘’]{2,80})[\"'`“”‘’]", task_text):
+        hard.append(f"exact mention: {quoted.strip()}")
+
+    for descriptor in SOFT_DESCRIPTOR_PATTERN.findall(task_text):
+        cleaned = re.sub(r"\s+", " ", descriptor.lower()).strip(" -")
+        if cleaned and not any(cleaned in item.lower() for item in hard):
+            soft.append(cleaned)
+
+    if re.search(r"\b(find|locate|search|look for|bring|get|put|place|move|buy|purchase)\b", task_text, re.I):
+        unknown.append("candidate identity and availability must be verified from observation")
+    if re.search(r"\b(color|size|price|location|destination|container|receptacle|tool|appliance)\b", task_text, re.I):
+        unknown.append("attribute satisfaction needs direct observation or state evidence before final commit")
+
+    return {
+        "hard": list(dict.fromkeys(hard))[:8],
+        "soft": list(dict.fromkeys(soft))[:6],
+        "unknown": list(dict.fromkeys(unknown))[:6],
+    }
+
+
+def _infer_evidence_stages(constraints: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    hard = constraints.get("hard") or []
+    soft = constraints.get("soft") or []
+    result_page: List[str] = []
+    detail_page: List[str] = []
+    final_commit: List[str] = []
+
+    for item in hard:
+        key = item.lower()
+        if "price/value limit" in key:
+            result_page.append(item)
+            final_commit.append(f"re-check {item}")
+        elif any(marker in key for marker in ("color:", "colour:", "size:", "fit type:", "material:")):
+            detail_page.append(item)
+            final_commit.append(f"select/apply {item} if exposed as an option")
+        elif any(marker in key for marker in ("location:", "destination:", "tool:", "container:", "receptacle:")):
+            detail_page.append(item)
+            final_commit.append(f"verify {item} before final action")
+        else:
+            result_page.append(item)
+            detail_page.append(item)
+
+    for item in soft:
+        detail_page.append(f"soft evidence: {item}")
+
+    if not result_page:
+        result_page.append("rough candidate category/type and visible budget only")
+    if not detail_page:
+        detail_page.append("inspect details/options/state before rejecting plausible candidates")
+    if not final_commit:
+        final_commit.append("before final commit, verify required explicit options/states are selected")
+
+    return {
+        "result_page": list(dict.fromkeys(result_page))[:8],
+        "detail_page": list(dict.fromkeys(detail_page))[:8],
+        "final_commit": list(dict.fromkeys(final_commit))[:8],
+    }
+
+
+def _extract_candidate_queue(snapshot: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(snapshot, dict):
+        return []
+    candidates: List[str] = []
+    for product in snapshot.get("webshop_products") or []:
+        if not isinstance(product, dict):
+            continue
+        asin = str(product.get("asin", "")).strip()
+        title = str(product.get("title", "")).strip()
+        price = str(product.get("price", "")).strip()
+        label = " | ".join(part for part in (asin, title, price) if part)
+        if label:
+            candidates.append(label)
+    for entity in snapshot.get("visible_entities") or []:
+        candidates.append(str(entity))
+    for entity in snapshot.get("inventory") or []:
+        candidates.append(f"held: {entity}")
+    return list(dict.fromkeys(candidates))[:8]
+
+
+def build_runtime_protocol_state(
+    task: str,
+    decision: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    decision = decision or {}
+    snapshot = decision.get("state_snapshot") or {}
+    trace = decision.get("trace_tail") or []
+    benchmark = str(snapshot.get("benchmark") or "generic")
+    action = _normalize_text(decision.get("action", ""))
+    failure_type = _normalize_text(decision.get("failure_type", decision.get("reason", "")))
+    candidates = _extract_candidate_queue(snapshot)
+    trace_actions = [
+        _normalize_text(item.get("action", ""))
+        for item in trace
+        if isinstance(item, dict)
+    ]
+    horizontal_steps = sum(1 for item in trace_actions if _is_horizontal_exploration_action(item, benchmark))
+    commit_steps = sum(1 for item in trace_actions if _is_candidate_commit_action(item, benchmark))
+
+    if "invalid_action" in failure_type or "stale_state" in failure_type or "precondition" in failure_type:
+        phase = "recover"
+    elif "exploration_without_commit" in failure_type or (candidates and horizontal_steps >= 2 and commit_steps == 0):
+        phase = "inspect_or_commit_best_candidate"
+    elif candidates and _is_candidate_commit_action(action, benchmark):
+        phase = "verify_candidate"
+    elif candidates:
+        phase = "inspect_candidate"
+    else:
+        phase = "explore"
+
+    next_policy: List[str] = []
+    next_policy.append("Preserve hard constraints; do not silently relax them during recovery.")
+    if candidates:
+        next_policy.append("Use the candidate queue before widening exploration; reject a candidate only with fresh contradictory evidence.")
+    if phase in {"inspect_or_commit_best_candidate", "inspect_candidate"}:
+        next_policy.append("Inspect or commit the best-so-far candidate if hard constraints have sufficient evidence and no direct contradiction.")
+    if phase == "recover":
+        next_policy.append("Repair the smallest failed precondition or stale target; avoid restarting solved phases.")
+    if not candidates:
+        next_policy.append("Explore with rewritten queries/actions first, then relax only soft constraints if no candidates appear.")
+
+    constraints = _infer_constraint_ledger(task)
+    return {
+        "phase": phase,
+        "constraints": constraints,
+        "evidence_stages": _infer_evidence_stages(constraints),
+        "candidates": candidates,
+        "tried_actions": list(dict.fromkeys([item for item in trace_actions if item]))[-8:],
+        "next_policy": next_policy,
+    }
+
+
 @dataclass
 class RuntimeRecompileDecision:
     reason: str
     step_index: int
     action: str
     observation: str
+    failure_type: str = ""
+    repair_hint: str = ""
     selected_skills_before: List[str] = field(default_factory=list)
     steps_consumed: int = 0
     repeated_observation_count: int = 0
@@ -170,6 +446,8 @@ class RuntimeRecompileDecision:
             "step_index": self.step_index,
             "action": self.action,
             "observation": self.observation,
+            "failure_type": self.failure_type,
+            "repair_hint": self.repair_hint,
             "selected_skills_before": list(self.selected_skills_before),
             "steps_consumed": self.steps_consumed,
             "repeated_observation_count": self.repeated_observation_count,
@@ -189,6 +467,203 @@ class RuntimeSkillRecompileRequested(RuntimeError):
         )
 
 
+FORBIDDEN_ACTION_PREFIXES = (
+    "abort",
+    "abort:",
+    "error:",
+    "report failure",
+    "done",
+    "task complete",
+)
+
+SKILL_AS_ACTION_PATTERNS = (
+    "[invoke",
+    "invoke ",
+    "call skill",
+    "run skill",
+    "trigger skill",
+    "use skill",
+    ".py",
+    "parse_query",
+    "object-locator",
+    "task-verifier",
+    "state-inspector",
+    "search-pattern-executor",
+)
+
+SKILL_NAME_PATTERN = re.compile(r"\b(?:alfworld|webshop|scienceworld)-[a-z0-9-]+\b", re.IGNORECASE)
+
+
+def classify_runtime_failure(
+    *,
+    action: str,
+    observation: str = "",
+    benchmark: str = "generic",
+    selected_skill_names: Optional[Sequence[str]] = None,
+) -> Dict[str, str]:
+    """Return a portable failure class and repair hint for action/observation pairs."""
+    action_key = _normalize_text(action)
+    observation_key = _normalize_text(observation)
+    skill_names = [str(name).lower() for name in (selected_skill_names or [])]
+
+    if not action_key or action_key in {"-", "none", "null"}:
+        return {
+            "failure_type": "invalid_action",
+            "reason": "empty_or_placeholder_action",
+            "repair_hint": "Generate a concrete environment action from the legal action space; do not emit placeholders.",
+        }
+
+    if any(action_key.startswith(prefix) for prefix in FORBIDDEN_ACTION_PREFIXES):
+        return {
+            "failure_type": "premature_termination",
+            "reason": "non_environment_termination_action",
+            "repair_hint": "Do not send abort/done/report-failure as an environment action; continue with the next verifiable action until reward or task_done changes.",
+        }
+
+    if (
+        any(pattern in action_key for pattern in SKILL_AS_ACTION_PATTERNS)
+        or SKILL_NAME_PATTERN.search(action_key)
+        or any(name and name in action_key for name in skill_names)
+    ):
+        return {
+            "failure_type": "skill_as_action",
+            "reason": "skill_name_used_as_environment_action",
+            "repair_hint": "Skills may only provide plans, constraints, and candidates. Convert skill advice into a legal environment action before env.step.",
+        }
+
+    if any(marker in observation_key for marker in AMBIGUOUS_MARKERS):
+        return {
+            "failure_type": "ambiguity_loop",
+            "reason": "ambiguous_reference",
+            "repair_hint": "Resolve ambiguity using the environment's requested numeric/index response, then resume the prior subgoal.",
+        }
+
+    failure_patterns = FAILURE_PATTERNS.get(benchmark, FAILURE_PATTERNS["generic"])
+    if any(pattern in observation_key for pattern in failure_patterns):
+        if any(marker in observation_key for marker in CAPACITY_MARKERS):
+            failure_type = "capacity_blocked"
+            repair_hint = "Preserve the carried object; deliver/place one held item or free capacity before taking another."
+        elif action_key.startswith("search") and any(
+            marker in observation_key for marker in SEARCH_EXHAUSTED_MARKERS
+        ):
+            failure_type = "search_exhausted"
+            repair_hint = "Broaden the query or advance to the next candidate; do not repeat the same over-constrained search."
+        elif action_key.startswith(("heat ", "cool ", "clean ")):
+            failure_type = "transformation_precondition_missing"
+            repair_hint = "Verify the object is held/nearby, locate the required appliance/tool, apply the transform once, then verify before delivery."
+        elif action_key.startswith(("take ", "pick ", "grab ")):
+            failure_type = "precondition_missing"
+            repair_hint = "Refresh the latest observation, verify proximity/container state/object id, then retry or choose a visible alternative."
+        elif action_key.startswith(("put ", "move ", "place ")):
+            failure_type = "precondition_missing"
+            repair_hint = "Verify the object is held/available and the destination is reachable/open before placing it."
+        elif action_key.startswith(("go to ", "click", "search", "open ", "close ")):
+            failure_type = "stale_state_or_invalid_target"
+            repair_hint = "Refresh state and choose the next candidate rather than repeating a failed target blindly."
+        else:
+            failure_type = "action_failure"
+            repair_hint = "Repair only the failed local step; preserve completed subgoals and avoid restarting solved phases."
+        return {
+            "failure_type": failure_type,
+            "reason": "environment_rejected_action",
+            "repair_hint": repair_hint,
+        }
+
+    return {"failure_type": "", "reason": "", "repair_hint": ""}
+
+
+def infer_runtime_protocol_hints(
+    task: str,
+    decision: Optional[Dict[str, Any]],
+    *,
+    max_hints: int = 5,
+) -> List[str]:
+    """Infer portable protocol reminders for the next runtime recompile patch."""
+    decision = decision or {}
+    snapshot = decision.get("state_snapshot") or {}
+    trace = decision.get("trace_tail") or []
+    task_key = _normalize_text(task)
+    action_key = _normalize_text(decision.get("action", ""))
+    observation_key = _normalize_text(decision.get("observation", ""))
+    failure_type = _normalize_text(decision.get("failure_type", decision.get("reason", "")))
+    combined = " ".join([task_key, action_key, observation_key, failure_type])
+    trace_actions = [
+        _normalize_text(item.get("action", ""))
+        for item in trace
+        if isinstance(item, dict)
+    ]
+    repeated_actions = {
+        action for action in trace_actions if action and trace_actions.count(action) >= 2
+    }
+    hints: List[str] = []
+
+    def add(text: str):
+        if text and text not in hints and len(hints) < max_hints:
+            hints.append(text)
+
+    search_trigger = (
+        "search_exhausted" in failure_type
+        or "stale_state_or_invalid_target" in failure_type
+        or "exploration_without_commit" in failure_type
+        or "stagnation" in failure_type
+        or any(marker in combined for marker in SEARCH_EXHAUSTED_MARKERS)
+        or any(word in task_key for word in ("find", "locate", "search", "look for"))
+    )
+    if search_trigger:
+        add(
+            "Use a candidate queue: refresh observation/results, mark failed targets or queries as tried, then choose the next visible/listed candidate instead of repeating the same action."
+        )
+        add(
+            "When search is over-constrained, drop secondary adjectives/filters first, keep the core target requirement, and inspect the candidate state before selecting."
+        )
+        add(
+            "Use an explore-then-commit rhythm: after several horizontal exploration steps without new information, stop expanding and verify the current best-so-far candidate before exploring again."
+        )
+    transform_trigger = (
+        "transformation" in failure_type
+        or re.search(r"\b(heat|cool|clean|wash|slice|toggle|turn on|turn off)\b", combined)
+        or any(word in task_key for word in ("hot", "cold", "cool", "clean", "heated", "cooled"))
+    )
+    if transform_trigger:
+        add(
+            "For transform tasks, use the four-step protocol: acquire/bring the object, locate the required appliance or tool, apply exactly one legal transform action, then verify state before delivery."
+        )
+        add(
+            "If the legal transform syntax is `verb {obj} with {tool}`, keep `{obj}` held/available and apply the `with` action directly; do not load, drop, or place the object into the tool unless the environment explicitly requires it."
+        )
+        add(
+            "If a transform action fails, do not switch goals; repair the missing precondition such as location, open/closed appliance state, held object, or exact object id."
+        )
+
+    inventory = snapshot.get("inventory") or []
+    transport_trigger = (
+        bool(inventory)
+        or "capacity_blocked" in failure_type
+        or re.search(r"\b(two|all|another|each|both)\b", task_key)
+        or action_key.startswith(("take ", "pick ", "grab ", "move ", "put ", "place "))
+    )
+    if transport_trigger:
+        add(
+            "Respect capacity and one-at-a-time transport: finish the current carried object's destination/transform before taking a different object."
+        )
+        add(
+            "For multi-object tasks, repeat a short loop per item: locate visible candidate, acquire it, satisfy transform/precondition, place it, then return for the next item."
+        )
+
+    if "ambigu" in failure_type or any(marker in observation_key for marker in AMBIGUOUS_MARKERS):
+        add(
+            "Resolve ambiguity with only the requested numeric/index response, then resume the same subgoal without changing target semantics."
+        )
+
+    if repeated_actions:
+        sample = sorted(repeated_actions)[0]
+        add(
+            f"The action `{sample}` already repeated; before trying it again, change candidate, location, query, or missing precondition."
+        )
+
+    return hints
+
+
 class RuntimeRecompileController:
     def __init__(
         self,
@@ -205,6 +680,8 @@ class RuntimeRecompileController:
         reward_plateau_threshold: int = 5,
         reward_plateau_min_progress: float = 0.2,
         high_progress_reward_threshold: float = 0.7,
+        exploration_commit_enabled: bool = False,
+        exploration_commit_threshold: int = 4,
         trace_tail: int = 6,
     ):
         self.benchmark = benchmark or "generic"
@@ -214,7 +691,7 @@ class RuntimeRecompileController:
         self.total_steps_before_attempt = int(total_steps_before_attempt)
         self.last_recompile_step = int(last_recompile_step)
         self.min_steps_between_recompiles = max(1, int(min_steps_between_recompiles))
-        self.stagnation_threshold = max(2, int(stagnation_threshold))
+        self.stagnation_threshold = max(1, int(stagnation_threshold))
         self.min_remaining_steps_to_recompile = max(
             1,
             int(min_remaining_steps_to_recompile),
@@ -222,6 +699,8 @@ class RuntimeRecompileController:
         self.reward_plateau_threshold = max(3, int(reward_plateau_threshold))
         self.reward_plateau_min_progress = max(0.0, float(reward_plateau_min_progress))
         self.high_progress_reward_threshold = max(0.0, float(high_progress_reward_threshold))
+        self.exploration_commit_enabled = bool(exploration_commit_enabled)
+        self.exploration_commit_threshold = max(2, int(exploration_commit_threshold))
         self.trace = deque(maxlen=max(2, int(trace_tail)))
         self.steps_consumed = 0
         self._last_observation_key = ""
@@ -231,6 +710,8 @@ class RuntimeRecompileController:
         self.best_task_reward = 0.0
         self.best_task_reward_normalized = 0.0
         self.steps_since_reward_improvement = 0
+        self.horizontal_exploration_count = 0
+        self.has_seen_candidates = False
 
     def record_step(
         self,
@@ -239,6 +720,7 @@ class RuntimeRecompileController:
         observation: str,
         task_done: bool,
         task_reward: float,
+        state_snapshot: Optional[Dict[str, Any]] = None,
     ) -> Optional[RuntimeRecompileDecision]:
         self.steps_consumed += 1
         action_text = str(action or "").strip()
@@ -273,13 +755,34 @@ class RuntimeRecompileController:
                 "observation": observation_text[:600],
             }
         )
+        has_candidates = _snapshot_has_candidates(state_snapshot)
+        self.has_seen_candidates = self.has_seen_candidates or has_candidates
+        if _is_candidate_commit_action(action_key, self.benchmark):
+            self.horizontal_exploration_count = 0
+        elif _is_horizontal_exploration_action(action_key, self.benchmark):
+            if self.has_seen_candidates:
+                self.horizontal_exploration_count += 1
+        elif observation_key:
+            self.horizontal_exploration_count = 0
 
         if not self.enabled or task_done:
             return None
 
-        reason = self._detect_reason(observation_key)
+        classification = classify_runtime_failure(
+            action=action_text,
+            observation=observation_text,
+            benchmark=self.benchmark,
+            selected_skill_names=self.selected_skill_names,
+        )
+        reason = self._detect_reason(action_key, observation_key, classification)
         if reason is None:
             return None
+        if reason == "exploration_without_commit":
+            classification = {
+                "failure_type": "exploration_without_commit",
+                "reason": "horizontal_exploration_without_commit",
+                "repair_hint": "Verify the best-so-far candidate before continuing broad exploration; preserve tried candidates and only resume exploration after that candidate is rejected by fresh observation.",
+            }
 
         step_index = self.total_steps_before_attempt + self.steps_consumed
         return RuntimeRecompileDecision(
@@ -287,6 +790,8 @@ class RuntimeRecompileController:
             step_index=step_index,
             action=action_text,
             observation=observation_text[:1200],
+            failure_type=classification.get("failure_type", ""),
+            repair_hint=classification.get("repair_hint", ""),
             selected_skills_before=list(self.selected_skill_names),
             steps_consumed=self.steps_consumed,
             repeated_observation_count=self.repeated_observation_count,
@@ -294,9 +799,76 @@ class RuntimeRecompileController:
             task_done=bool(task_done),
             task_reward=float(task_reward or 0.0),
             trace_tail=list(self.trace),
+            state_snapshot=dict(state_snapshot or {}),
         )
 
-    def _detect_reason(self, observation_key: str) -> Optional[str]:
+    def record_guard_violation(
+        self,
+        *,
+        action: str,
+        failure_type: str,
+        reason: str,
+        repair_hint: str,
+    ) -> Optional[RuntimeRecompileDecision]:
+        if not self.enabled:
+            return None
+        self.steps_consumed += 1
+        action_text = str(action or "").strip()
+        step_index = self.total_steps_before_attempt + self.steps_consumed
+        if step_index - self.last_recompile_step < self.min_steps_between_recompiles:
+            return None
+        if self.max_total_steps is not None:
+            remaining_steps = self.max_total_steps - step_index
+            if remaining_steps < self.min_remaining_steps_to_recompile:
+                return None
+        observation = f"Runtime guard blocked non-executable action: {reason}. {repair_hint}"
+        self.trace.append(
+            {
+                "step": step_index,
+                "action": action_text,
+                "observation": observation[:600],
+            }
+        )
+        return RuntimeRecompileDecision(
+            reason=reason or "invalid_action",
+            step_index=step_index,
+            action=action_text,
+            observation=observation,
+            failure_type=failure_type or "invalid_action",
+            repair_hint=repair_hint,
+            selected_skills_before=list(self.selected_skill_names),
+            steps_consumed=self.steps_consumed,
+            task_done=False,
+            task_reward=self.best_task_reward,
+            trace_tail=list(self.trace),
+        )
+
+    def record_guard_hint(
+        self,
+        *,
+        action: str,
+        reason: str,
+        repair_hint: str,
+    ) -> int:
+        self.steps_consumed += 1
+        action_text = str(action or "").strip()
+        step_index = self.total_steps_before_attempt + self.steps_consumed
+        observation = f"Runtime guard hint: {reason}. {repair_hint}"
+        self.trace.append(
+            {
+                "step": step_index,
+                "action": action_text,
+                "observation": observation[:600],
+            }
+        )
+        return step_index
+
+    def _detect_reason(
+        self,
+        action_key: str,
+        observation_key: str,
+        classification: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
         current_step = self.total_steps_before_attempt + self.steps_consumed
         if current_step - self.last_recompile_step < self.min_steps_between_recompiles:
             return None
@@ -305,10 +877,22 @@ class RuntimeRecompileController:
             if remaining_steps < self.min_remaining_steps_to_recompile:
                 return None
 
+        # Require at least 2 consecutive identical observations before ambiguity / stagnation /
+        # action-loop triggers, so stagnation_threshold=1 means "fire on first *repeat*" not on step 1.
+        min_repeat = max(2, self.stagnation_threshold)
+
         if any(marker in observation_key for marker in AMBIGUOUS_MARKERS):
-            if self.repeated_observation_count >= self.stagnation_threshold:
+            if self.repeated_observation_count >= min_repeat:
                 return "ambiguity_loop"
             return None
+
+        classification = classification or {}
+        failure_type = classification.get("failure_type")
+        if failure_type in {"skill_as_action", "invalid_action", "premature_termination"}:
+            return classification.get("reason") or failure_type
+
+        if failure_type == "exploration_without_commit":
+            return classification.get("reason") or failure_type
 
         failure_patterns = FAILURE_PATTERNS.get(self.benchmark, FAILURE_PATTERNS["generic"])
         if any(pattern in observation_key for pattern in failure_patterns):
@@ -319,10 +903,17 @@ class RuntimeRecompileController:
                     and self.repeated_action_count < self.stagnation_threshold
                 ):
                     return None
-            return "action_failure"
+            return failure_type or "action_failure"
 
         if self.best_task_reward_normalized >= self.high_progress_reward_threshold:
             return None
+
+        if (
+            self.exploration_commit_enabled
+            and self.has_seen_candidates
+            and self.horizontal_exploration_count >= self.exploration_commit_threshold
+        ):
+            return "exploration_without_commit"
 
         if (
             self.best_task_reward_normalized >= self.reward_plateau_min_progress
@@ -330,11 +921,22 @@ class RuntimeRecompileController:
         ):
             return "reward_plateau"
 
-        if self.repeated_observation_count >= self.stagnation_threshold:
-            return "stagnation"
+        # Some environments acknowledge valid candidate/option selections without changing
+        # the rendered observation. Do not interrupt a sequence of different commit actions
+        # solely because the page text stayed identical; repeated identical commit actions
+        # are still caught by the action-loop check below.
+        if (
+            self.repeated_observation_count >= min_repeat
+            and _is_candidate_commit_action(action_key, self.benchmark)
+            and self.repeated_action_count < min_repeat
+        ):
+            return None
 
-        if self.repeated_action_count >= self.stagnation_threshold:
+        if self.repeated_action_count >= min_repeat:
             return "action_loop"
+
+        if self.repeated_observation_count >= min_repeat:
+            return "stagnation"
 
         return None
 
@@ -346,6 +948,7 @@ class RuntimeRecompileEnvProxy:
         controller: RuntimeRecompileController,
         step_adapter: Callable[[Any, Any], Dict[str, Any]],
         benchmark: str = "generic",
+        initial_state: Optional[Dict[str, Any]] = None,
     ):
         self._env = env
         self._controller = controller
@@ -359,8 +962,26 @@ class RuntimeRecompileEnvProxy:
         self._open_receptacles: List[str] = []
         self._completed_transfers: List[Dict[str, str]] = []
         self._completed_transforms: List[Dict[str, str]] = []
+        self._webshop_products: List[Dict[str, str]] = []
+        self._soft_guard_counts: Dict[str, int] = {}
+        self._load_state_snapshot(initial_state or {})
+
+    def _load_state_snapshot(self, snapshot: Dict[str, Any]):
+        if not isinstance(snapshot, dict):
+            return
+        self._current_location = _coerce_text(snapshot.get("current_location", self._current_location))
+        self._latest_observation_text = _coerce_text(snapshot.get("latest_observation", self._latest_observation_text))
+        self._latest_visible_entities = list(snapshot.get("visible_entities") or self._latest_visible_entities)
+        self._carried_objects = list(snapshot.get("inventory") or self._carried_objects)
+        self._visited_locations = list(snapshot.get("visited_locations") or self._visited_locations)
+        self._open_receptacles = list(snapshot.get("open_receptacles") or self._open_receptacles)
+        self._completed_transfers = list(snapshot.get("completed_transfers") or self._completed_transfers)
+        self._completed_transforms = list(snapshot.get("completed_transforms") or self._completed_transforms)
+        self._webshop_products = list(snapshot.get("webshop_products") or self._webshop_products)
 
     def _repair_action(self, action_text: str) -> str:
+        if self._benchmark == "webshop":
+            return self._repair_webshop_action(action_text)
         if self._benchmark != "alfworld":
             return action_text
         repaired = _clean_action_phrase(action_text)
@@ -399,6 +1020,61 @@ class RuntimeRecompileEnvProxy:
             return f"go to {repaired[8:].strip()}"
 
         return repaired
+
+    def _repair_webshop_action(self, action_text: str) -> str:
+        text = str(action_text or "").strip()
+        click_match = re.match(r"^click\[(.*)\]$", text, re.IGNORECASE)
+        if not click_match:
+            return text
+        target = click_match.group(1).strip()
+        target_key = _normalize_webshop_key(target)
+        if not target_key:
+            return text
+
+        nav_aliases = {
+            "next": "Next >",
+            ">": "Next >",
+            "next >": "Next >",
+            "prev": "< Prev",
+            "< prev": "< Prev",
+            "previous": "< Prev",
+            "back": "< Prev",
+            "back to results": "< Prev",
+            "< back": "< Prev",
+            "< back to results": "< Prev",
+            "back to search": "Back to Search",
+            "< back to search": "Back to Search",
+            "buy now": "Buy Now",
+        }
+        if target_key in nav_aliases:
+            return f"click[{nav_aliases[target_key]}]"
+        if WEBSHOP_ASIN_PATTERN.fullmatch(target):
+            return text
+
+        best_asin = ""
+        best_score = 0
+        for product in self._webshop_products:
+            asin = product.get("asin", "")
+            title = product.get("title", "")
+            title_key = _normalize_webshop_key(title)
+            if not asin or not title_key:
+                continue
+            if target_key == title_key:
+                best_asin = asin
+                best_score = 10_000
+                break
+            if target_key in title_key or title_key in target_key:
+                score = min(len(target_key), len(title_key))
+            else:
+                target_terms = {term for term in target_key.split() if len(term) > 2}
+                title_terms = {term for term in title_key.split() if len(term) > 2}
+                score = len(target_terms & title_terms)
+            if score > best_score:
+                best_score = score
+                best_asin = asin
+        if best_asin and best_score >= 3:
+            return f"click[{best_asin}]"
+        return text
 
     def _repair_object_reference(self, obj_ref: str) -> str:
         cleaned = _clean_action_phrase(obj_ref)
@@ -470,6 +1146,7 @@ class RuntimeRecompileEnvProxy:
             "open_receptacles": list(self._open_receptacles),
             "completed_transfers": list(self._completed_transfers[-6:]),
             "completed_transforms": list(self._completed_transforms[-6:]),
+            "webshop_products": list(self._webshop_products[:12]),
         }
 
     def _update_state_from_action(self, action_text: str, observation_text: str):
@@ -509,6 +1186,9 @@ class RuntimeRecompileEnvProxy:
         if not normalized_observation:
             return
         self._latest_observation_text = normalized_observation
+        if self._benchmark == "webshop":
+            self._webshop_products = self._extract_webshop_products(normalized_observation)
+            return
         arrival_match = ALFWORLD_ARRIVAL_PATTERN.search(normalized_observation)
         if arrival_match:
             self._current_location = _clean_action_phrase(arrival_match.group(1))
@@ -535,8 +1215,79 @@ class RuntimeRecompileEnvProxy:
             self._forget_carried_object(moved_object)
             self._remember_transfer(moved_object, destination)
 
+    def _extract_webshop_products(self, observation_text: str) -> List[Dict[str, str]]:
+        parts = [part.strip() for part in str(observation_text or "").split("[SEP]")]
+        products: List[Dict[str, str]] = []
+        idx = 0
+        while idx < len(parts):
+            token = parts[idx].strip()
+            if WEBSHOP_ASIN_PATTERN.fullmatch(token) and idx + 2 < len(parts):
+                title = parts[idx + 1].strip()
+                price = parts[idx + 2].strip()
+                if title and price.startswith("$"):
+                    products.append({"asin": token, "title": title, "price": price})
+                    idx += 3
+                    continue
+            idx += 1
+        return products
+
+    def _build_guard_hint_observation(self, failure_type: str, reason: str, repair_hint: str) -> str:
+        candidates = _extract_candidate_queue(self._build_state_snapshot())
+        latest_key = _normalize_text(self._latest_observation_text)
+        hints = [
+            f"Runtime guard hint: blocked non-executable action ({reason or failure_type}).",
+            repair_hint,
+            "Continue with one concrete legal environment action from the latest observation.",
+        ]
+        if self._benchmark == "webshop":
+            if "buy now" in latest_key:
+                hints.append("If the task is ready, use Action: click[Buy Now].")
+            elif candidates:
+                hints.append(f"Inspect a visible candidate before widening search, for example Action: click[{candidates[0].split(' | ')[0]}].")
+            elif "back to search" in latest_key:
+                hints.append("If no candidate is actionable, use Action: click[Back to Search] or a concrete search[...].")
+        elif self._latest_visible_entities:
+            hints.append(f"Use a visible entity/action target such as: {self._latest_visible_entities[0]}.")
+        if candidates:
+            hints.append("Do not summarize or stop while candidates or final actions remain.")
+        return " ".join(part for part in hints if part)
+
+    def _synthetic_guard_result(self, observation: str):
+        return observation, self._controller.best_task_reward, False, {"runtime_guard_hint": True}
+
     def step(self, action: Any):
         original_action_text = _extract_action_text(action)
+        guard = classify_runtime_failure(
+            action=original_action_text,
+            benchmark=self._benchmark,
+            selected_skill_names=self._controller.selected_skill_names,
+        )
+        if guard.get("failure_type") in {"skill_as_action", "invalid_action", "premature_termination"}:
+            soft_hint_reasons = {"empty_or_placeholder_action", "non_environment_termination_action"}
+            guard_key = guard.get("reason", "") or guard.get("failure_type", "")
+            if guard_key in soft_hint_reasons and self._soft_guard_counts.get(guard_key, 0) < 1:
+                self._soft_guard_counts[guard_key] = self._soft_guard_counts.get(guard_key, 0) + 1
+                observation = self._build_guard_hint_observation(
+                    guard.get("failure_type", ""),
+                    guard.get("reason", ""),
+                    guard.get("repair_hint", ""),
+                )
+                self._controller.record_guard_hint(
+                    action=original_action_text,
+                    reason=guard.get("reason", ""),
+                    repair_hint=guard.get("repair_hint", ""),
+                )
+                return self._synthetic_guard_result(observation)
+            decision = self._controller.record_guard_violation(
+                action=original_action_text,
+                failure_type=guard.get("failure_type", ""),
+                reason=guard.get("reason", ""),
+                repair_hint=guard.get("repair_hint", ""),
+            )
+            if decision is not None:
+                decision.state_snapshot = self._build_state_snapshot()
+                raise RuntimeSkillRecompileRequested(decision)
+
         repaired_action_text = self._repair_action(original_action_text)
         action_payload = action
         if repaired_action_text and repaired_action_text != original_action_text:
@@ -553,6 +1304,7 @@ class RuntimeRecompileEnvProxy:
             observation=observation_text,
             task_done=_coerce_bool(snapshot.get("task_done", False)),
             task_reward=_coerce_float(snapshot.get("task_reward", 0.0)),
+            state_snapshot=self._build_state_snapshot(),
         )
         if decision is not None:
             decision.state_snapshot = self._build_state_snapshot()
@@ -595,6 +1347,7 @@ def execute_compiled_procedure(
     active_skill_names = list(selected_skill_names)
     overall_procedure = ""
     overall_procedure_code = ""
+    runtime_state_snapshot: Dict[str, Any] = {}
 
     while total_steps < max_steps:
         if progress_callback:
@@ -653,6 +1406,16 @@ def execute_compiled_procedure(
                     "runtime_recompile_high_progress_reward_threshold",
                     0.7,
                 ),
+                exploration_commit_enabled=getattr(
+                    skill_module,
+                    "runtime_recompile_exploration_commit_enabled",
+                    False,
+                ),
+                exploration_commit_threshold=getattr(
+                    skill_module,
+                    "runtime_recompile_exploration_commit_threshold",
+                    4,
+                ),
                 trace_tail=getattr(skill_module, "runtime_recompile_trace_tail", 6),
             )
             proxy = RuntimeRecompileEnvProxy(
@@ -660,6 +1423,7 @@ def execute_compiled_procedure(
                 controller,
                 step_adapter,
                 benchmark=skill_module._infer_benchmark(),
+                initial_state=runtime_state_snapshot,
             )
             try:
                 if progress_callback:
@@ -699,6 +1463,7 @@ def execute_compiled_procedure(
                 }
             except RuntimeSkillRecompileRequested as exc:
                 decision = exc.decision.to_dict()
+                runtime_state_snapshot = dict(decision.get("state_snapshot") or runtime_state_snapshot)
                 append_observation_message(messages, decision.get("observation", ""))
                 total_steps = max(total_steps, int(decision["step_index"]))
                 task_done = bool(decision.get("task_done", False))

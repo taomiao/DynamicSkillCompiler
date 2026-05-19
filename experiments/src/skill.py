@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import re
@@ -9,8 +11,11 @@ from src.utils import get_llm_response
 from src.prompt_generator import (
     retrieve_relevant_skills_prompt,
     generate_overall_procedure_prompt,
-    generate_overall_procedure_code_prompt
+    generate_overall_procedure_code_prompt,
+    refine_dsc_procedure_prompt,
+    refine_dsc_procedure_addendum_prompt,
 )
+from src.runtime_recompile import build_runtime_protocol_state, infer_runtime_protocol_hints
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 SKILLNET_SRC = ROOT_DIR / "skillnet-ai" / "src"
@@ -25,8 +30,164 @@ from skillnet_ai.compiler import (
     LocalEnvironment,
     LocalSkillLibraryRetriever,
     QueryOptimizer,
+    SemanticSoftMatcher,
     TaskDecomposer,
 )
+
+
+def _extract_tagged_block(text: str, tag: str) -> str | None:
+    """Return inner text for <tag>...</tag>, case-insensitive; unclosed open tag returns tail."""
+    if not text or not str(text).strip():
+        return None
+    s = str(text)
+    pattern = re.compile(rf"<{re.escape(tag)}>\s*(.*?)\s*</{re.escape(tag)}>", re.DOTALL | re.IGNORECASE)
+    m = pattern.search(s)
+    if m:
+        inner = m.group(1).strip()
+        return inner if inner else None
+    open_re = re.compile(rf"<{re.escape(tag)}>\s*(.*)$", re.DOTALL | re.IGNORECASE)
+    om = open_re.search(s)
+    if om:
+        tail = om.group(1).strip()
+        return tail if tail else None
+    return None
+
+
+def _strip_analysis_section(text: str) -> str:
+    """Drop a leading <Analysis>...</Analysis> block if present."""
+    if not text:
+        return ""
+    s = str(text)
+    low = s.lower()
+    start = low.find("<analysis>")
+    end = low.find("</analysis>")
+    if start >= 0 and end > start:
+        return s[end + len("</analysis>") :].strip()
+    return s.strip()
+
+
+def _procedure_refiner_phase_count(text: str) -> int:
+    if not text:
+        return 0
+    return len(re.findall(r"\bPhase\s*\d+", str(text), re.I))
+
+
+def _parse_overall_procedure_response(response: str) -> str:
+    """
+    Robust extraction of procedural guidance. Prefer XML tags; fall back after </Analysis>
+    or the full body so a missing tag never raises.
+    """
+    if response is None:
+        return ""
+    raw = str(response).strip()
+    if not raw:
+        return ""
+
+    block = _extract_tagged_block(raw, "Overall_Procedure")
+    if block:
+        return block
+
+    stripped = _strip_analysis_section(raw)
+    if stripped and stripped != raw:
+        block = _extract_tagged_block(stripped, "Overall_Procedure")
+        if block:
+            return block
+        if stripped:
+            return stripped
+
+    for alt in (
+        r"##\s*ERRATA",
+        r"##\s*NEXT STEPS",
+        r"PROCEDURE PATCH MODE",
+        r"Phase\s*1[:：]",
+    ):
+        if re.search(alt, raw, re.IGNORECASE):
+            return _strip_analysis_section(raw) or raw
+
+    return _strip_analysis_section(raw) or raw
+
+
+def _parse_refiner_addendum_response(response: str) -> str | None:
+    """Extract <Refiner_Addendum>...</Refiner_Addendum>; return None if missing or empty."""
+    raw = str(response or "").strip()
+    if not raw:
+        return None
+    block = _extract_tagged_block(raw, "Refiner_Addendum")
+    if block is None:
+        return None
+    block = block.strip()
+    return block if block else None
+
+
+def _dsc_refined_procedure_guard_ok(
+    draft: str,
+    refined: str,
+    *,
+    min_chars: int,
+    min_length_ratio: float,
+    min_phase_slack: int,
+) -> bool:
+    """Reject refiner output that is over-compressed or collapses too many phases."""
+    d = (draft or "").strip()
+    r = (refined or "").strip()
+    if len(r) < min_chars:
+        return False
+    if len(d) >= 400 and len(r) < min_length_ratio * len(d):
+        return False
+    dp = _procedure_refiner_phase_count(d)
+    rp = _procedure_refiner_phase_count(r)
+    if dp >= 3:
+        need = max(1, dp - min_phase_slack)
+        if rp < need:
+            return False
+    return True
+
+
+def _parse_relevant_skill_names_response(response: str) -> list:
+    """Parse skill name list from retrieve_relevant_skills LLM output without brittle [1] indexing."""
+    if not response or not str(response).strip():
+        return []
+
+    s = str(response)
+    raw = _extract_tagged_block(s, "Relevant_Skill_Names")
+    if raw is None:
+        fence = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", s, re.IGNORECASE)
+        if fence:
+            raw = fence.group(1)
+        else:
+            start = s.find("[")
+            if start >= 0:
+                dec = json.JSONDecoder()
+                try:
+                    data, _ = dec.raw_decode(s[start:])
+                    if isinstance(data, list):
+                        return [str(x) for x in data if x]
+                except json.JSONDecodeError:
+                    pass
+            return []
+
+    raw = raw.strip().strip("`").strip()
+    if raw.lower().startswith("json"):
+        raw = raw[4:].lstrip()
+    raw = raw.strip()
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("[")
+        if start >= 0:
+            try:
+                data, _ = json.JSONDecoder().raw_decode(raw[start:])
+            except json.JSONDecodeError:
+                return []
+        else:
+            return []
+
+    if isinstance(data, list):
+        return [str(x) for x in data if x]
+    if isinstance(data, str):
+        return [data]
+    return []
 
 
 class SkillModule:
@@ -59,9 +220,9 @@ class SkillModule:
             "runtime_recompile_enabled",
             self.selection_strategy == "dsc",
         )
-        self.runtime_recompile_max_count = kwargs.get("runtime_recompile_max_count", 1)
+        self.runtime_recompile_max_count = kwargs.get("runtime_recompile_max_count", 3)
         self.runtime_recompile_min_interval_steps = kwargs.get("runtime_recompile_min_interval_steps", 2)
-        self.runtime_recompile_stagnation_threshold = kwargs.get("runtime_recompile_stagnation_threshold", 2)
+        self.runtime_recompile_stagnation_threshold = kwargs.get("runtime_recompile_stagnation_threshold", 1)
         self.runtime_recompile_min_remaining_steps = kwargs.get("runtime_recompile_min_remaining_steps", 1)
         self.runtime_recompile_reward_plateau_steps = kwargs.get(
             "runtime_recompile_reward_plateau_steps",
@@ -76,6 +237,38 @@ class SkillModule:
             0.7,
         )
         self.runtime_recompile_trace_tail = kwargs.get("runtime_recompile_trace_tail", 6)
+        # Optional second LLM pass (e.g. Claude Opus) to refine procedural text after first draft.
+        _ref_env = str(os.environ.get("DSC_PROCEDURE_REFINER_ENABLED", "")).lower()
+        self.dsc_procedure_refiner_enabled = bool(
+            kwargs.get(
+                "dsc_procedure_refiner_enabled",
+                _ref_env in ("1", "true", "yes"),
+            )
+        )
+        _ref_model_kw = kwargs.get("dsc_procedure_refiner_model")
+        self.dsc_procedure_refiner_model = (
+            _ref_model_kw
+            if _ref_model_kw
+            else (os.environ.get("DSC_PROCEDURE_REFINER_MODEL") or "claude-opus-4-20250514")
+        )
+        self.dsc_procedure_refiner_min_chars = int(kwargs.get("dsc_procedure_refiner_min_chars", 80))
+        self.dsc_procedure_refiner_min_length_ratio = float(
+            kwargs.get("dsc_procedure_refiner_min_length_ratio", 0.42)
+        )
+        self.dsc_procedure_refiner_min_phase_slack = int(
+            kwargs.get("dsc_procedure_refiner_min_phase_slack", 1)
+        )
+        # append = non-destructive addendum (default); replace = legacy full rewrite (risky).
+        _mode_kw = kwargs.get("dsc_procedure_refiner_mode")
+        _env_mode = str(os.environ.get("DSC_PROCEDURE_REFINER_MODE", "")).strip().lower()
+        if _mode_kw is not None and str(_mode_kw).strip():
+            self.dsc_procedure_refiner_mode = str(_mode_kw).strip().lower()
+        elif _env_mode in ("append", "replace", "off"):
+            self.dsc_procedure_refiner_mode = _env_mode
+        else:
+            self.dsc_procedure_refiner_mode = "append"
+        if self.dsc_procedure_refiner_mode not in ("append", "replace", "off"):
+            self.dsc_procedure_refiner_mode = "append"
         self.runtime_recompile_count = 0
         self.runtime_recompile_events = []
         self.runtime_last_recompile_step = -999
@@ -84,7 +277,11 @@ class SkillModule:
         self.last_seed_skill_names = []
         self.last_quality_reference_skill_names = []
         self.last_selected_skill_names = []
-        self.last_deterministic_procedure_kind = None
+
+        # Semantic soft matcher: replaces hard keyword matching in SkillUtilityScorer.
+        # Initialised lazily via _get_soft_matcher() to avoid blocking __init__.
+        self.compiler_use_semantic_matching = kwargs.get("compiler_use_semantic_matching", True)
+        self._soft_matcher: SemanticSoftMatcher | None = None
 
         self.metadata = self._load_metadata()
 
@@ -101,6 +298,34 @@ class SkillModule:
         else:
             self.overall_procedure_examples = ''
 
+
+    def _get_soft_matcher(self) -> SemanticSoftMatcher | None:
+        """Return a lazily-initialised SemanticSoftMatcher, or None if disabled.
+
+        The matcher is created once per SkillModule instance and reused across
+        all compile() calls.  Embeddings are cached on disk so repeat runs
+        incur no API cost for previously seen tokens.
+        """
+        if not self.compiler_use_semantic_matching:
+            return None
+        if self._soft_matcher is not None:
+            return self._soft_matcher
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            return None
+        try:
+            self._soft_matcher = SemanticSoftMatcher.from_openai(
+                api_key=api_key,
+                base_url=os.environ.get("OPENAI_BASE_URL") or None,
+                cache_dir=os.path.expanduser("~/.skillnet/emb"),
+            )
+            # Pre-embed all skill descriptions so scoring never blocks mid-task.
+            lib = LocalSkillLibraryRetriever(skills_dir=str(self.skills_dir))
+            all_assets = lib.retrieve(None)
+            self._soft_matcher.warm_up_skills(all_assets)
+        except Exception:
+            self._soft_matcher = None
+        return self._soft_matcher
 
     def _load_metadata(self):
         """Load existing metadata from file, return empty dict if file does not exist."""
@@ -200,10 +425,6 @@ class SkillModule:
         """
         Generate overall procedure by combining individual skill contents.
         """
-        deterministic = self._deterministic_procedure(task, skill_names)
-        if deterministic is not None:
-            return deterministic
-
         compiler_summary = ""
         if self.selection_strategy == "dsc" and self.last_compilation is not None:
             if self.last_quality_reference_skill_names:
@@ -213,26 +434,85 @@ class SkillModule:
         else:
             skill_contents = self._build_full_skill_payload(skill_names)
 
+        patch_mode = bool(task) and (
+            "[Runtime Recompile]" in task or "PROCEDURE PATCH MODE" in task
+        )
         response = get_llm_response(
             generate_overall_procedure_prompt(
                 task,
                 self.overall_procedure_examples,
                 skill_contents,
                 compiler_summary=compiler_summary,
+                procedure_patch_mode=patch_mode,
             ),
             is_string=True,
             model=self.model
         )
-        overall_procedure = response.split("<Overall_Procedure>")[1].split("</Overall_Procedure>")[0].strip()
-        return overall_procedure
+        procedure = _parse_overall_procedure_response(response)
+        if (
+            self.selection_strategy == "dsc"
+            and self.dsc_procedure_refiner_enabled
+            and self.last_compilation is not None
+            and not patch_mode
+            and self.dsc_procedure_refiner_mode != "off"
+        ):
+            try:
+                if self.dsc_procedure_refiner_mode == "append":
+                    addendum_raw = get_llm_response(
+                        refine_dsc_procedure_addendum_prompt(
+                            task=task,
+                            draft_procedure=procedure,
+                            relevant_skill_names=skill_names,
+                            compiler_summary=compiler_summary,
+                        ),
+                        is_string=True,
+                        model=self.dsc_procedure_refiner_model,
+                    )
+                    addendum = _parse_refiner_addendum_response(addendum_raw)
+                    if addendum and len(addendum) <= 6000:
+                        procedure = (
+                            procedure.rstrip()
+                            + "\n\n## DSC refiner addendum\n\n"
+                            + addendum.strip()
+                        )
+                elif self.dsc_procedure_refiner_mode == "replace":
+                    refine_messages = refine_dsc_procedure_prompt(
+                        task=task,
+                        relevant_skill_names=skill_names,
+                        skill_contents=skill_contents,
+                        compiler_summary=compiler_summary,
+                        draft_procedure=procedure,
+                    )
+                    refined_raw = get_llm_response(
+                        refine_messages,
+                        is_string=True,
+                        model=self.dsc_procedure_refiner_model,
+                    )
+                    refined = _parse_overall_procedure_response(refined_raw)
+                    if refined and len(refined.strip()) > 50:
+                        if _dsc_refined_procedure_guard_ok(
+                            procedure,
+                            refined,
+                            min_chars=self.dsc_procedure_refiner_min_chars,
+                            min_length_ratio=self.dsc_procedure_refiner_min_length_ratio,
+                            min_phase_slack=self.dsc_procedure_refiner_min_phase_slack,
+                        ):
+                            procedure = refined
+                        else:
+                            print(
+                                "[WARN] DSC procedure refiner (replace) rejected by guard "
+                                f"(len {len(refined)}/{len(procedure)} chars, "
+                                f"phases {_procedure_refiner_phase_count(refined)}/"
+                                f"{_procedure_refiner_phase_count(procedure)}); keeping draft."
+                            )
+            except Exception as exc:
+                print(f"[WARN] DSC procedure refiner failed ({self.dsc_procedure_refiner_model}): {exc}")
+        return procedure
     
     def generate_overall_procedure_code(self, task, overall_procedure):
         """
         Generate overall procedure code.
         """
-        if self.last_deterministic_procedure_kind == "scienceworld_conductivity":
-            return self._scienceworld_static_procedure_code(task, overall_procedure)
-
         response = get_llm_response(
             generate_overall_procedure_code_prompt(task, overall_procedure, self.procedure_code_template),
             is_string=True,
@@ -303,6 +583,7 @@ class SkillModule:
                 coverage_floor=self.compiler_coverage_floor,
                 compile_stage=self._current_compile_stage(task),
             ),
+            soft_matcher=self._get_soft_matcher(),
         )
         environment = LocalEnvironment(
             cwd=str(Path.cwd()),
@@ -311,7 +592,7 @@ class SkillModule:
             shell=os.environ.get("SHELL", "sh"),
             os_name=sys.platform,
             available_bins=set(),
-            benchmark=self._infer_benchmark(),
+            benchmark="generic",
         )
         return compiler.compile(task, environment=environment)
 
@@ -415,129 +696,6 @@ class SkillModule:
 
         return merged
 
-    def _select_scienceworld_conductivity_skill_names(self, available):
-        selected = []
-
-        def pick_first(candidates):
-            for candidate in candidates:
-                if candidate in available and candidate not in selected:
-                    selected.append(candidate)
-                    return True
-            return False
-
-        pick_first([
-            "scienceworld-object-locator",
-            "scienceworld-target-locator",
-            "scienceworld-room-navigator",
-            "scienceworld-room-explorer",
-        ])
-        pick_first([
-            "scienceworld-object-focuser",
-            "scienceworld-task-focuser",
-        ])
-        pick_first([
-            "scienceworld-conductivity-tester",
-            "scienceworld-circuit-builder",
-            "scienceworld-circuit-connector",
-        ])
-        pick_first([
-            "scienceworld-object-classifier",
-            "scienceworld-conditional-placer",
-            "scienceworld-object-placer",
-            "scienceworld-container-relocator",
-        ])
-
-        if len(selected) >= 4:
-            return selected
-        return []
-
-    def _is_scienceworld_temperature_query(self, task):
-        if self._infer_benchmark() != "scienceworld":
-            return False
-        query = task.lower()
-        return "thermometer" in query or "temperature" in query
-
-    def _select_scienceworld_temperature_skill_names(self, available):
-        selected = []
-
-        def pick_first(candidates):
-            for candidate in candidates:
-                if candidate in available and candidate not in selected:
-                    selected.append(candidate)
-                    return True
-            return False
-
-        pick_first([
-            "scienceworld-object-locator",
-            "scienceworld-room-navigator",
-            "scienceworld-room-scanner",
-        ])
-        pick_first([
-            "scienceworld-task-focuser",
-            "scienceworld-object-focuser",
-        ])
-        pick_first([
-            "scienceworld-temperature-measurer",
-        ])
-        pick_first([
-            "scienceworld-conditional-box-placer",
-            "scienceworld-object-classifier",
-            "scienceworld-object-placer",
-        ])
-        pick_first([
-            "scienceworld-inventory-focus",
-            "scienceworld-room-scanner",
-        ])
-
-        return selected if len(selected) >= 4 else []
-
-    def _is_scienceworld_growth_query(self, task):
-        if self._infer_benchmark() != "scienceworld":
-            return False
-        query = task.lower()
-        return "grow" in query and "seed" in query
-
-    def _select_scienceworld_growth_skill_names(self, available):
-        selected = []
-
-        def pick_first(candidates):
-            for candidate in candidates:
-                if candidate in available and candidate not in selected:
-                    selected.append(candidate)
-                    return True
-            return False
-
-        pick_first([
-            "scienceworld-room-navigator",
-            "scienceworld-object-locator",
-        ])
-        pick_first([
-            "scienceworld-object-focuser",
-            "scienceworld-task-focuser",
-        ])
-        pick_first([
-            "scienceworld-pot-preparer",
-            "scienceworld-planting-operation",
-        ])
-        pick_first([
-            "scienceworld-planting-coordinator",
-        ])
-        pick_first([
-            "scienceworld-liquid-filler",
-            "soil-extraction",
-        ])
-        pick_first([
-            "scienceworld-growth-focuser",
-        ])
-        pick_first([
-            "controlled-waiting",
-        ])
-        pick_first([
-            "scienceworld-ambiguous-action-resolution",
-        ])
-
-        return selected if len(selected) >= 5 else []
-
     def _build_quality_first_compilation(self, compiled_package, reference_skill_names):
         """
         Preserve the baseline/SkillNet reference skill set and let DSC compress content
@@ -603,244 +761,6 @@ class SkillModule:
             "Quality-first mode preserved the SkillNet reference skill set and compressed their contents."
         )
         return compiled_package
-
-    def _deterministic_procedure(self, task, skill_names):
-        self.last_deterministic_procedure_kind = None
-        if self.selection_strategy == "dsc" and self._is_scienceworld_conductivity_task(task, skill_names):
-            self.last_deterministic_procedure_kind = "scienceworld_conductivity"
-            return self._scienceworld_conductivity_procedure(task)
-        return None
-
-    def _is_scienceworld_conductivity_query(self, task):
-        if self._infer_benchmark() != "scienceworld":
-            return False
-        query = task.lower()
-        return "electrically conductive" in query or "conductivity" in query
-
-    def _is_scienceworld_conductivity_task(self, task, skill_names):
-        if not self._is_scienceworld_conductivity_query(task):
-            return False
-        return "scienceworld-conductivity-tester" in set(skill_names)
-
-    def _scienceworld_conductivity_procedure(self, task):
-        target_object, source_room, conductive_box, nonconductive_box = self._extract_scienceworld_conductivity_targets(task)
-        return f"""# TASK PROCEDURAL GUIDANCE: Test Electrical Conductivity and Sort
-
-Task:
-{task}
-
-Phase 1: Locate and acquire the target substance
-1. `teleport to {source_room}`
-2. `look around`
-3. Identify the exact object name `{target_object}` from observation and reuse that exact name everywhere.
-4. `pick up {target_object}`
-5. `focus on {target_object}`
-6. Confirm the substance is now in inventory before leaving the room.
-
-Phase 2: Prepare the workshop circuit
-1. `teleport to workshop`
-2. `look around`
-3. Identify:
-   - one battery
-   - three wires (prefer `black wire`, `blue wire`, and `yellow wire` if present; otherwise use any three visible wires)
-   - one actuator component to test power flow:
-     - prefer a light bulb
-     - otherwise use an electric motor or electric buzzer if that is the visible actuator
-   - the answer boxes named in the task description
-4. Keep the substance in inventory for the fast path. Only drop it later if fallback wiring is needed.
-5. Confirm the substance has `terminal 1` and `terminal 2`.
-
-Phase 3: Fast conductivity check
-Use exact observed contact-point syntax. Try the shortest working circuit first:
-battery anode -> wire 1 -> actuator cathode/terminal 2
-actuator anode/terminal 1 -> wire 2 -> substance terminal 1
-substance terminal 2 -> battery cathode
-
-Actions:
-1. `connect battery anode to <WIRE1> terminal 1`
-2. `connect <WIRE1> terminal 2 to <ACTUATOR> cathode` or `<ACTUATOR> terminal 2`
-3. `connect <ACTUATOR> anode` or `<ACTUATOR> terminal 1` to `<WIRE2> terminal 1`
-4. `connect <WIRE2> terminal 2 to <SUBSTANCE> terminal 1`
-5. `connect <SUBSTANCE> terminal 2 to battery cathode`
-6. `wait1`
-7. `look at <ACTUATOR>`
-
-Decision:
-- If the actuator is on or activated, the substance is conductive.
-- If the actuator is still off or deactivated, run the fallback stable three-wire circuit below before concluding nonconductive.
-
-Phase 4: Fallback stable conductivity circuit
-Only if the fast path leaves the actuator off:
-1. `drop <SUBSTANCE>` so it is directly in the workshop.
-2. Rebuild the stable three-wire circuit:
-   - `connect battery cathode to <WIRE2> terminal 1`
-   - `connect <WIRE1> terminal 2 to <ACTUATOR> cathode` or `<ACTUATOR> terminal 2`
-   - `connect <WIRE3> terminal 2 to <ACTUATOR> anode` or `<ACTUATOR> terminal 1`
-   - `connect <SUBSTANCE> terminal 1 to <WIRE2> terminal 2`
-   - `connect <SUBSTANCE> terminal 2 to <WIRE3> terminal 1`
-3. `wait1`
-4. `wait1`
-5. `look at <ACTUATOR>`
-6. If the actuator is on, treat as conductive. Otherwise treat as nonconductive.
-
-Phase 5: Place into the correct answer box
-1. If conductive: `move <SUBSTANCE> to {conductive_box}`
-2. If nonconductive: `move <SUBSTANCE> to {nonconductive_box}`
-3. Task is complete only when the environment confirms the correct placement.
-
-Error handling:
-- If a command fails, immediately `look around`, verify exact names and terminals, and retry with the corrected syntax.
-- If the environment returns `Ambiguous request: Please enter the number...`, respond with only the matching option index, such as `0`.
-- Never invent rooms, components, colors, or terminals that are not present in the latest observation.
-- Do not change the circuit topologies above.
-- Keep the substance in inventory for the fast path; only drop it if the fallback path is needed."""
-
-    def _extract_scienceworld_conductivity_targets(self, task):
-        object_match = re.search(r"determine if (.+?) is electrically conductive", task, re.IGNORECASE)
-        room_match = re.search(r"is located around the (.+?)[\.,]", task, re.IGNORECASE)
-        conductive_match = re.search(
-            r"If it is electrically conductive, place it in the (.+?)[\\.]",
-            task,
-            re.IGNORECASE,
-        )
-        nonconductive_match = re.search(
-            r"If it is electrically nonconductive, place it in the (.+?)[\\.]",
-            task,
-            re.IGNORECASE,
-        )
-        object_name = object_match.group(1).strip() if object_match else "unknown substance S"
-        source_room = room_match.group(1).strip() if room_match else "workshop"
-        conductive_box = conductive_match.group(1).strip() if conductive_match else "orange box"
-        nonconductive_box = (
-            nonconductive_match.group(1).strip()
-            if nonconductive_match
-            else "yellow box"
-        )
-        return object_name, source_room, conductive_box, nonconductive_box
-
-    def _scienceworld_static_procedure_code(self, task, overall_procedure):
-        escaped = overall_procedure.replace('"""', r"\"\"\"")
-        target_object, source_room, conductive_box, nonconductive_box = self._extract_scienceworld_conductivity_targets(task)
-        return f'''# ==========================================
-# Procedure code template for ScienceWorld environment
-# ==========================================
-def overall_procedure_code(
-    env,
-    llm,
-    model: str,
-    parse_action,
-    messages: list = [],
-    max_steps: int = 30
-):
-    """
-    Deterministic conductivity solver for a quality-critical ScienceWorld task.
-    """
-    import re
-
-    procedure_guidelines = """{escaped}"""
-    messages.append({{"role": "user", "content": procedure_guidelines}})
-
-    target_object = {target_object!r}
-    source_room = {source_room!r}
-    conductive_box = {conductive_box!r}
-    nonconductive_box = {nonconductive_box!r}
-    task_done = False
-    current_steps = 0
-    task_reward = 0
-
-    def run_action(action: str):
-        nonlocal task_done, current_steps, task_reward
-        if task_done or current_steps >= max_steps:
-            return ""
-        messages.append({{"role": "assistant", "content": f"Action: {{action}}"}})
-        observation, step_reward, task_done, info = env.step(action)
-        task_reward = info['score'] if info.get('score') is not None and info['score'] > task_reward else task_reward
-        print(f'\\033[93mObservation: \\n{{observation}}\\033[0m')
-        messages.append({{"role": "user", "content": f"Observation: {{observation}}"}})
-        current_steps += 1
-        return observation
-
-    def unique_matches(pattern: str, text: str):
-        matches = []
-        for match in re.findall(pattern, text, flags=re.IGNORECASE):
-            name = match.strip()
-            if name not in matches:
-                matches.append(name)
-        return matches
-
-    def choose_components(observation: str):
-        wires = unique_matches(r"a ([a-z ]+ wire)", observation)
-        bulbs = unique_matches(r"a ([a-z ]+ light bulb)", observation)
-        motors = unique_matches(r"a ([a-z ]*electric motor)", observation)
-        buzzers = unique_matches(r"a ([a-z ]*electric buzzer)", observation)
-        preferred_wires = [wire for wire in ("black wire", "blue wire", "yellow wire") if wire in wires]
-        for wire in wires:
-            if wire not in preferred_wires:
-                preferred_wires.append(wire)
-            if len(preferred_wires) >= 3:
-                break
-        if len(preferred_wires) < 3:
-            raise RuntimeError(f"Unable to identify three wires from observation: {{observation}}")
-        if "green light bulb" in bulbs:
-            actuator = "green light bulb"
-        elif bulbs:
-            actuator = bulbs[0]
-        elif motors:
-            actuator = motors[0]
-        elif buzzers:
-            actuator = buzzers[0]
-        else:
-            raise RuntimeError(f"Unable to identify an actuator from observation: {{observation}}")
-        return preferred_wires[0], preferred_wires[1], preferred_wires[2], actuator
-
-    def actuator_terminals(actuator_name: str):
-        lowered = actuator_name.lower()
-        if "light bulb" in lowered:
-            return "cathode", "anode"
-        return "terminal 2", "terminal 1"
-
-    source_observation = run_action(f"teleport to {{source_room}}")
-    source_observation = run_action("look around")
-    run_action(f"pick up {{target_object}}")
-    run_action(f"focus on {{target_object}}")
-    workshop_observation = run_action("teleport to workshop")
-    workshop_observation = run_action("look around")
-    wire1, wire2, wire3, actuator = choose_components(workshop_observation)
-    actuator_negative, actuator_positive = actuator_terminals(actuator)
-    run_action(f"connect battery anode to {{wire1}} terminal 1")
-    run_action(f"connect {{wire1}} terminal 2 to {{actuator}} {{actuator_negative}}")
-    run_action(f"connect {{actuator}} {{actuator_positive}} to {{wire2}} terminal 1")
-    run_action(f"connect {{wire2}} terminal 2 to {{target_object}} terminal 1")
-    run_action(f"connect {{target_object}} terminal 2 to battery cathode")
-    run_action("wait1")
-    bulb_observation = run_action(f"look at {{actuator}}")
-
-    bulb_is_on = (
-        "which is on" in bulb_observation.lower()
-        or "which is activated" in bulb_observation.lower()
-        or " is on." in bulb_observation.lower()
-        or " is activated." in bulb_observation.lower()
-    )
-    if not bulb_is_on:
-        run_action(f"drop {{target_object}}")
-        run_action(f"connect battery cathode to {{wire2}} terminal 1")
-        run_action(f"connect {{wire1}} terminal 2 to {{actuator}} {{actuator_negative}}")
-        run_action(f"connect {{wire3}} terminal 2 to {{actuator}} {{actuator_positive}}")
-        run_action(f"connect {{target_object}} terminal 1 to {{wire2}} terminal 2")
-        run_action(f"connect {{target_object}} terminal 2 to {{wire3}} terminal 1")
-        run_action("wait1")
-        run_action("wait1")
-        bulb_observation = run_action(f"look at {{actuator}}")
-        bulb_is_on = (
-            "which is on" in bulb_observation.lower()
-            or "which is activated" in bulb_observation.lower()
-            or " is on." in bulb_observation.lower()
-            or " is activated." in bulb_observation.lower()
-        )
-    target_box = conductive_box if bulb_is_on else nonconductive_box
-    run_action(f"move {{target_object}} to {{target_box}}")
-
-    return messages, task_done, task_reward, current_steps'''
 
     def _fallback_compiled_skill(self, skill_name):
         asset = self.last_candidate_assets.get(skill_name)
@@ -922,6 +842,7 @@ def overall_procedure_code(
                 coverage_floor=self.compiler_coverage_floor,
                 compile_stage=self._current_compile_stage(task_text),
             ),
+            soft_matcher=self._get_soft_matcher(),
         )
         environment = LocalEnvironment(
             cwd=str(Path.cwd()),
@@ -930,7 +851,7 @@ def overall_procedure_code(
             shell=os.environ.get("SHELL", "sh"),
             os_name=sys.platform,
             available_bins=set(),
-            benchmark=self._infer_benchmark(),
+            benchmark="generic",
         )
         return probe._effective_config(query_plan, subgoals, environment)
 
@@ -947,6 +868,72 @@ def overall_procedure_code(
         if isinstance(decision, dict):
             self.runtime_recompile_events.append(dict(decision))
             self.runtime_last_recompile_step = int(decision.get("step_index", self.runtime_last_recompile_step))
+
+    def _detect_syntax_errors(self, decision: dict) -> str:
+        """Analyze trace_tail to identify repeated action syntax failures and return a hint string."""
+        trace = decision.get("trace_tail") or []
+        if not trace:
+            return ""
+
+        SYNTAX_PATTERNS = [
+            ("no known action",       "unknown_action"),
+            ("already connected",     "already_connected"),
+            ("must be disconnected",  "needs_disconnect"),
+            ("not possible",          "not_possible"),
+            ("not valid",             "not_valid"),
+        ]
+
+        counts: dict = {key: 0 for _, key in SYNTAX_PATTERNS}
+        failed_actions: list = []
+        for step in trace:
+            obs_lower = step.get("observation", "").lower()
+            act = step.get("action", "").strip()
+            for pattern, key in SYNTAX_PATTERNS:
+                if pattern in obs_lower:
+                    counts[key] += 1
+                    if act and act not in failed_actions:
+                        failed_actions.append(act)
+                    break
+
+        total_errors = sum(counts.values())
+        if total_errors < 2:
+            return ""
+
+        hints = []
+        if counts["already_connected"] + counts["needs_disconnect"] >= 1:
+            hints.append(
+                "- A connection endpoint is already occupied. Use the environment's exact documented "
+                "disconnect action, including all required endpoint names, before reconnecting."
+            )
+        if counts["unknown_action"] >= 2:
+            hints.append(
+                "- Action format error: environment rejected actions with wrong syntax. "
+                "Avoid parenthetical qualifiers like '(containing ...)' in object names; "
+                "use the shortest exact object name from the latest observation."
+            )
+        if not hints:
+            hints.append(
+                f"- {total_errors} syntax errors detected. "
+                "Prioritize skills that provide verified exact-syntax examples for this environment."
+            )
+
+        failed_sample = "; ".join(failed_actions[:3])
+        result = (
+            f"ACTION SYNTAX ERRORS DETECTED ({total_errors} failures in last {len(trace)} steps):\n"
+            + "\n".join(hints)
+        )
+        if failed_sample:
+            result += f"\nFailed actions sample: {failed_sample}"
+        return result + "\n"
+
+    def _format_runtime_list(self, items, limit: int = 6) -> str:
+        cleaned = [str(item).strip() for item in (items or []) if str(item).strip()]
+        if not cleaned:
+            return "- none\n"
+        lines = [f"- {item}" for item in cleaned[:limit]]
+        if len(cleaned) > limit:
+            lines.append(f"- ... ({len(cleaned) - limit} more)")
+        return "\n".join(lines) + "\n"
 
     def build_runtime_recompile_task(self, task_prompt, messages, decision, remaining_steps):
         decision = decision or {}
@@ -979,7 +966,7 @@ def overall_procedure_code(
         relaxation_hint = ""
         if effective.profile_name == "search" or any(
             marker in observation_text
-            for marker in ("no results", "not found", "no product", "0 results", "no matches")
+            for marker in ("no results", "not found", "no candidate", "no product", "0 results", "no matches")
         ):
             relaxation_hint = (
                 "If the current path looks over-constrained or retrieval-heavy, relax non-essential constraints "
@@ -991,17 +978,75 @@ def overall_procedure_code(
                 "focus on the missing final subgoals, and avoid restarting solved phases.\n"
             )
 
+        syntax_error_hint = self._detect_syntax_errors(decision)
+        failure_type = decision.get("failure_type") or decision.get("reason", "unknown")
+        repair_hint = decision.get("repair_hint") or ""
+        protocol_hints = infer_runtime_protocol_hints(task_prompt, decision)
+        protocol_state = build_runtime_protocol_state(task_prompt, decision)
+        protocol_hint_text = ""
+        if protocol_hints:
+            protocol_hint_text = (
+                "PROTOCOL PATCH HINTS:\n"
+                + "\n".join(f"- {hint}" for hint in protocol_hints)
+                + "\n"
+            )
+        constraints = protocol_state.get("constraints") or {}
+        evidence_stages = protocol_state.get("evidence_stages") or {}
+        protocol_state_text = (
+            "RUNTIME PROTOCOL STATE:\n"
+            f"- phase: {protocol_state.get('phase', 'unknown')}\n"
+            "Hard constraints to preserve:\n"
+            f"{self._format_runtime_list(constraints.get('hard') or [])}\n"
+            "Soft constraints that may be relaxed only after no viable candidates appear:\n"
+            f"{self._format_runtime_list(constraints.get('soft') or [])}\n"
+            "Unknowns requiring observation/state evidence:\n"
+            f"{self._format_runtime_list(constraints.get('unknown') or [])}\n"
+            "Evidence stages:\n"
+            "  Discovery/list/search state should only filter by:\n"
+            f"{self._format_runtime_list(evidence_stages.get('result_page') or [])}"
+            "  Inspection/detail state should verify:\n"
+            f"{self._format_runtime_list(evidence_stages.get('detail_page') or [])}"
+            "  Final commit must satisfy:\n"
+            f"{self._format_runtime_list(evidence_stages.get('final_commit') or [])}"
+            "Candidate queue / best-so-far evidence:\n"
+            f"{self._format_runtime_list(protocol_state.get('candidates') or [])}\n"
+            "Recently tried actions:\n"
+            f"{self._format_runtime_list(protocol_state.get('tried_actions') or [])}\n"
+            "Next policy:\n"
+            f"{self._format_runtime_list(protocol_state.get('next_policy') or [])}\n"
+        )
+        guard_hint = (
+            "EXECUTION GUARD CONSTRAINTS:\n"
+            "- Skills are knowledge sources only; never output a skill name, '[invoke ...]', 'use/call/trigger skill', or tool label as an env action.\n"
+            "- Do not output abort/done/report-failure/error as env actions while steps remain. Continue with the next legal, verifiable action.\n"
+            "- Repair the smallest failed local step using the failure type below; preserve completed subgoals from the state snapshot.\n"
+            "- Before retrying a failed action, refresh or use the latest observation, verify preconditions, and choose a different candidate if the same action already failed.\n"
+            "- If carrying/capacity might block progress, transport one object to its target before taking another.\n"
+            "- Preserve explicit hard constraints from the runtime protocol state. If recovery requires relaxing anything, relax only soft constraints and state that choice in the patch.\n"
+            "- When a candidate queue exists, inspect/verify/commit a candidate before widening exploration unless the latest observation directly contradicts it.\n"
+            "- Do not reject plausible candidates in a discovery/list state because fine-grained attributes or option-like values are missing from surface text; verify those in an inspection/state-specific step.\n"
+        )
+
         return (
             "[Runtime Recompile]\n"
+            "PROCEDURE PATCH MODE: When the compiler regenerates procedural guidance, it must output a **short patch** "
+            "(ERRATA + NEXT STEPS, under ~400 words), not a full duplicate manual. Skills retrieval should still prefer "
+            "the minimal set that unblocks the next environment actions.\n\n"
             "Select the smallest skill set that can make immediate progress from the current state.\n"
-            "Prefer action-driving skills. Add verification, pagination, detail, or support skills only if they are needed in the next few steps.\n"
+            "Prefer action-driving skills. Add verification, navigation, inspection, or support skills only if they are needed in the next few steps.\n"
             "Prefer immediate next-step skills over future-stage skills.\n"
             "Preserve previously useful scaffold skills unless the new failure clearly shows they are irrelevant.\n"
             f"Inferred task profile: {effective.profile_name}\n"
             f"{relaxation_hint}"
+            f"{syntax_error_hint}"
             f"Original task:\n{task_prompt}\n\n"
             f"Failure reason: {decision.get('reason', 'unknown')}\n"
+            f"Failure type: {failure_type}\n"
+            f"Repair hint: {repair_hint}\n"
             f"Remaining steps: {remaining_steps}\n"
+            f"{protocol_state_text}"
+            f"{guard_hint}"
+            f"{protocol_hint_text}"
             f"Current observation: {decision.get('observation', '')}\n"
             f"Selected skills before failure: {decision.get('selected_skills_before', [])}\n"
             f"State snapshot:\n" + ("\n".join(state_lines) if state_lines else "- none") + "\n\n"
@@ -1019,8 +1064,8 @@ def overall_procedure_code(
             is_string=True,
             model=self.model
         )
-        relevant_skill_names = response.split("<Relevant_Skill_Names>")[1].split("</Relevant_Skill_Names>")[0].strip("`json\n").strip("`\n").strip("```\n")
-        return json.loads(relevant_skill_names)
+        names = _parse_relevant_skill_names_response(response)
+        return names if names else []
 
     def _build_full_skill_payload(self, skill_names):
         skill_contents = []
@@ -1083,18 +1128,41 @@ def overall_procedure_code(
 
         metrics = self.last_compilation.metrics
         execution_order = " -> ".join(self.last_compilation.execution_order)
+
+        # Build a semantic phase-coverage description instead of raw numeric scores.
+        # Raw scores like "coverage_score: 0.09" can mislead the LLM procedure generator
+        # into thinking the skill package is inadequate even when the right skills are selected.
+        compiled_lookup = {
+            item.asset.name: item
+            for item in self.last_compilation.compiled_skills
+        }
+        phase_lines: list[str] = []
+        for skill_name in skill_names:
+            item = compiled_lookup.get(skill_name)
+            if item is None:
+                continue
+            subgoal_ids = item.assigned_subgoals
+            subgoal_descs = []
+            for subgoal in self.last_compilation.subgoals:
+                if subgoal.subgoal_id in subgoal_ids:
+                    subgoal_descs.append(subgoal.description[:60])
+            if subgoal_descs:
+                phase_lines.append(f"  {skill_name}: covers [{'; '.join(subgoal_descs)}]")
+            else:
+                phase_lines.append(f"  {skill_name}: selected as relevant to the task")
+
+        phase_coverage_text = (
+            "\n".join(phase_lines)
+            if phase_lines
+            else "  (all selected skills are relevant to the overall task)"
+        )
+
         summary = (
             "Dynamic Skill Compiler Summary\n"
             "The following compiled package should be treated as a new task-specific skill synthesized from the source skills.\n"
-            f"- Selected skills: {metrics.selected_count}/{metrics.candidate_count}\n"
-            f"- Covered subgoals: {metrics.covered_subgoal_count}/{metrics.subgoal_count}\n"
-            f"- Coverage score: {metrics.coverage_score:.3f}\n"
-            f"- Redundancy reduction: {metrics.redundancy_reduction:.3f}\n"
-            f"- Fragments retained: {metrics.fragment_count_after}/{metrics.fragment_count_before}\n"
-            f"- Estimated token cost: {metrics.estimated_token_cost_before:.2f} -> "
-            f"{metrics.estimated_token_cost_after:.2f}\n"
-            f"- Fragment token cost: {metrics.fragment_token_cost_after:.2f}\n"
-            f"- Execution order: {execution_order}\n"
+            f"Selected {metrics.selected_count} skills from {metrics.candidate_count} candidates.\n"
+            f"Skill roles and covered phases:\n{phase_coverage_text}\n"
+            f"Suggested execution order: {execution_order}\n"
         )
         return skill_contents, summary
 
