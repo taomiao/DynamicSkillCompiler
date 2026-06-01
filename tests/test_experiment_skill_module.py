@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ROOT_DIR = Path(__file__).resolve().parents[1]
 EXPERIMENTS_DIR = ROOT_DIR / "experiments"
 if str(EXPERIMENTS_DIR) not in sys.path:
     sys.path.append(str(EXPERIMENTS_DIR))

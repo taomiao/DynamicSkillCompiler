@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dynamic-skill-compiler"
+version = "0.1.0"
+description = "Task-driven compiler for agent skill libraries."
+readme = "README.md"
+authors = [{ name = "Dynamic Skill Compiler Team" }]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "openai>=1.109.1",
+    "numpy>=1.24",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

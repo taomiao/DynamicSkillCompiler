@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, List, Set
 
-from skillnet_ai.compiler.models import QueryPlan
+from dynamic_skill_compiler.models import QueryPlan
 
 
 STOPWORDS = {

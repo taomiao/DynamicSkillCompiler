@@ -2,53 +2,54 @@
 
 ## Goal
 
-Dynamic Skill Compiler (DSC) adds a task-driven compilation layer on top of SkillNet. Instead of directly using all retrieved skills, DSC compiles a query-specific, dependency-complete, low-redundancy, localized skill package.
+Dynamic Skill Compiler (DSC) is a task-driven compiler for local agent skill libraries. Instead of passing a raw top-k skill list into the agent, DSC builds a task-specific skill graph and emits a compact, dependency-aware package that is easier for the executor to use.
 
 ## Compiler Pipeline
 
 1. Query optimization
-   - Normalize the raw query.
-   - Extract compact keyword queries for retrieval.
+   - Normalize the raw task.
+   - Extract compact retrieval queries.
    - Generate semantic queries for broader recall.
-   - Infer intents and constraints such as low-token, local-only, or evaluation-heavy tasks.
+   - Infer constraints such as low-token, local-only, or evaluation-heavy tasks.
 
 2. Query understanding
-   - Convert the query into a `QueryPlan`.
+   - Convert the task into a `QueryPlan`.
    - Separate required capabilities from optional capabilities.
-   - Preserve task constraints for downstream scoring.
+   - Preserve benchmark and environment constraints for downstream scoring.
 
 3. Skill retrieval
-   - Retrieve candidates from the local skill library.
-   - Retrieve candidates from SkillNet search.
+   - Retrieve candidates from local skill libraries.
    - Merge and deduplicate candidates into a unified pool.
+   - Use semantic and lexical signals when embeddings are available.
 
 4. Skill graph construction
-   - Preserve declared `depend_on`, `belong_to`, `compose_with`, `similar_to` edges.
-   - Infer additional `similar_to` edges via capability overlap.
+   - Preserve declared `depend_on`, `belong_to`, `compose_with`, and `similar_to` edges.
+   - Infer extra `similar_to` edges from capability overlap.
    - Build a multi-relational graph over all candidates.
 
 5. Task-aware compilation
    - Score each candidate by task coverage, quality, cost, and latency.
    - Remove low-relevance nodes.
-   - Collapse `similar_to` clusters by keeping the best utility path.
+   - Collapse redundant `similar_to` clusters while keeping the best utility path.
    - Prune broad parent skills when more specific children satisfy the task.
    - Reintroduce required dependencies to maintain executability.
    - Trim isolated low-value nodes.
 
-6. Localization
+6. Localization and compression
    - Rewrite generic commands and placeholders against the active workspace.
    - Resolve `{cwd}`, `{workspace_root}`, and Python binary selection.
-   - Prepare environment-specific instructions for execution.
+   - Select relevant fragments instead of always passing whole skill files.
+   - Preserve authoritative reference guidance when quality-first mode is enabled.
 
 7. Compilation output
    - A compiled subgraph.
    - An execution order.
    - A dropped-skill audit trail.
-   - Cost, redundancy, and coverage metrics.
+   - Coverage, redundancy, token-cost, and pass-trace metrics.
 
-## Intended Gains Over SkillNet Baseline
+## Intended Gains Over Direct Retrieval
 
-Compared with the SkillNet baseline, DSC targets gains in:
+DSC targets gains in:
 
 - Safety and executability
   - Dependency closure after pruning prevents broken packages.
@@ -56,7 +57,7 @@ Compared with the SkillNet baseline, DSC targets gains in:
   - Task coverage is explicitly measured before finalizing the package.
 - Maintainability
   - Redundant overlapping skills are removed, reducing graph sprawl.
-- Cost-awareness
+- Cost awareness
   - Candidate selection prefers lower token and lower execution cost skills when coverage is similar.
 - Token efficiency
   - The compiler removes unrelated, overlapping, and overly broad skills before packaging.
@@ -66,36 +67,32 @@ Compared with the SkillNet baseline, DSC targets gains in:
 The current implementation provides:
 
 - Query optimizer
-- In-memory, local-library, and SkillNet-search retrievers
+- In-memory and local-library retrievers
+- Optional semantic retrieval cache
 - Multi-relational graph builder
 - Heuristic compiler with redundancy pruning and dependency repair
 - Environment localization
+- Fragment-level skill compression
 - Unit tests for the core compiler logic
 
-## Next Experimental Upgrades
+## Experimental Upgrades
 
-To make the paper stronger, the next versions should add:
+The benchmark harness can evaluate DSC on ScienceWorld, ALFWorld, and WebShop with these ablations:
 
-1. Learned or LLM-based query decomposition
-2. Retrieval reranking with environment-aware signals
-3. Exact subgraph optimization instead of greedy pruning
-4. Token-level prompt compression for compiled skills
-5. Benchmark integration into ALFWorld, ScienceWorld, and WebShop
-6. Ablation studies:
-   - no query optimization
-   - no graph pruning
-   - no localization
-   - no dependency repair
-   - no token-aware scoring
+- no query optimization
+- no graph pruning
+- no localization
+- no dependency repair
+- no fragment compression
+- direct retrieval baseline
 
 ## Suggested Paper Framing
 
-- Baseline: SkillNet retrieval + direct use of top-k skills
+- Baseline: direct retrieval plus raw top-k skill use
 - Method: Dynamic Skill Compiler
-- Main claim: compile-time optimization of skill graphs improves quality and token efficiency
+- Main claim: compile-time optimization of skill graphs improves task success and token efficiency
 - Key measured outcomes:
   - task success
-  - average evaluation score over the five SkillNet dimensions
   - prompt token usage
   - selected skill count
   - graph density after compilation

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List
 
-from skillnet_ai.compiler.models import LocalEnvironment, SkillFragment, Subgoal
+from dynamic_skill_compiler.models import LocalEnvironment, SkillFragment, Subgoal
 
 
 DOMAIN_ACTIONS = {}

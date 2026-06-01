@@ -3,19 +3,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
-from skillnet_ai.compiler.decompose import TaskDecomposer
-from skillnet_ai.compiler.fragments import FragmentMatcher, SkillFragmentExtractor
-from skillnet_ai.compiler.graph import (
+from dynamic_skill_compiler.decompose import TaskDecomposer
+from dynamic_skill_compiler.fragments import FragmentMatcher, SkillFragmentExtractor
+from dynamic_skill_compiler.graph import (
     DEFAULT_GRAPH_PASSES,
     GRAPH_PASS_PRESETS,
     SkillGraphBuilder,
     SkillGraphCompiler,
     SkillUtilityScorer,
 )
-from skillnet_ai.compiler.grounding import EnvironmentGrounder
-from skillnet_ai.compiler.models import CompiledSkillPackage, LocalEnvironment, SkillAsset, SkillFragment, Subgoal
-from skillnet_ai.compiler.query import QueryOptimizer
-from skillnet_ai.compiler.retriever import SkillRetriever
+from dynamic_skill_compiler.grounding import EnvironmentGrounder
+from dynamic_skill_compiler.models import CompiledSkillPackage, LocalEnvironment, SkillAsset, SkillFragment, Subgoal
+from dynamic_skill_compiler.query import QueryOptimizer
+from dynamic_skill_compiler.retriever import SkillRetriever
 
 
 @dataclass

@@ -18,11 +18,11 @@ from src.prompt_generator import (
 from src.runtime_recompile import build_runtime_protocol_state, infer_runtime_protocol_hints
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-SKILLNET_SRC = ROOT_DIR / "skillnet-ai" / "src"
-if str(SKILLNET_SRC) not in sys.path:
-    sys.path.insert(0, str(SKILLNET_SRC))
+DSC_SRC = ROOT_DIR / "src"
+if str(DSC_SRC) not in sys.path:
+    sys.path.insert(0, str(DSC_SRC))
 
-from skillnet_ai.compiler import (
+from dynamic_skill_compiler import (
     CompilerConfig,
     CompiledSkill,
     DynamicSkillCompiler,
@@ -318,7 +318,7 @@ class SkillModule:
             self._soft_matcher = SemanticSoftMatcher.from_openai(
                 api_key=api_key,
                 base_url=os.environ.get("OPENAI_BASE_URL") or None,
-                cache_dir=os.path.expanduser("~/.skillnet/emb"),
+                cache_dir=os.path.expanduser("~/.dynamic_skill_compiler/emb"),
             )
             # Pre-embed all skill descriptions so scoring never blocks mid-task.
             lib = LocalSkillLibraryRetriever(skills_dir=str(self.skills_dir))
@@ -940,7 +940,7 @@ def overall_procedure_code(
 
     def _build_quality_first_compilation(self, compiled_package, reference_skill_names):
         """
-        Preserve the baseline/SkillNet reference skill set and let DSC compress content
+        Preserve the baseline reference skill set and let DSC compress content
         rather than deleting quality-critical skills.
         """
         compiled_lookup = {
@@ -1000,7 +1000,7 @@ def overall_procedure_code(
         metrics.fragment_count_after = fragment_count_after
         metrics.fragment_token_cost_after = fragment_token_cost_after
         compiled_package.notes.append(
-            "Quality-first mode preserved the SkillNet reference skill set and compressed their contents."
+            "Quality-first mode preserved the reference skill set and compressed their contents."
         )
         return compiled_package
 
@@ -1016,7 +1016,7 @@ def overall_procedure_code(
             assigned_subgoals=[],
             localized_instructions=self._fallback_localized_instructions(skill_name),
             utility_score=0.0,
-            selected_reason="preserved_from_skillnet_reference",
+            selected_reason="preserved_from_reference",
         )
 
     def _fallback_localized_instructions(self, skill_name):
@@ -1484,7 +1484,7 @@ def overall_procedure_code(
 
         summary = (
             "Quality-First Skill Package Summary\n"
-            "Preserve the following SkillNet reference skills as authoritative task guidance.\n"
+            "Preserve the following reference skills as authoritative task guidance.\n"
             "Use the localized summaries to stay concise, but prefer the concrete action patterns in each SKILL.md over abstract rewrites.\n"
         )
         return skill_contents, summary

@@ -4,8 +4,8 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Set
 
-from skillnet_ai.compiler.models import QueryPlan, Subgoal
-from skillnet_ai.compiler.query import QueryOptimizer
+from dynamic_skill_compiler.models import QueryPlan, Subgoal
+from dynamic_skill_compiler.query import QueryOptimizer
 
 
 CONNECTORS = {"and", "then", "after", "before", "finally", "otherwise", "else"}

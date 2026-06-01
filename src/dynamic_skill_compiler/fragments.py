@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List
 
-from skillnet_ai.compiler.models import SkillAsset, SkillFragment, Subgoal
+from dynamic_skill_compiler.models import SkillAsset, SkillFragment, Subgoal
 
 
 LINE_SPLIT = re.compile(r"[.\n]")

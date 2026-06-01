@@ -29,7 +29,7 @@ Usage
     matcher = SemanticSoftMatcher.from_openai(
         api_key="sk-...",
         base_url="http://...",           # optional
-        cache_dir="~/.skillnet/emb",    # optional
+        cache_dir="~/.dynamic_skill_compiler/emb",    # optional
     )
 
     # Pre-embed all skills once (call after loading the skill library).
@@ -65,7 +65,7 @@ except ImportError:
     _HAS_NUMPY = False
 
 if TYPE_CHECKING:
-    from skillnet_ai.compiler.models import SkillAsset
+    from dynamic_skill_compiler.models import SkillAsset
 
 
 class SemanticSoftMatcher:
@@ -86,7 +86,7 @@ class SemanticSoftMatcher:
     def __init__(
         self,
         embed_fn: Callable[[List[str]], List[List[float]]],
-        cache_dir: Optional[str] = "~/.skillnet/emb",
+        cache_dir: Optional[str] = "~/.dynamic_skill_compiler/emb",
         semantic_bonus_weight: float = 0.30,
         semantic_floor: float = 0.20,
     ) -> None:
@@ -117,7 +117,7 @@ class SemanticSoftMatcher:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: str = "text-embedding-3-small",
-        cache_dir: str = "~/.skillnet/emb",
+        cache_dir: str = "~/.dynamic_skill_compiler/emb",
         **kwargs,
     ) -> "SemanticSoftMatcher":
         """Create a matcher backed by the OpenAI embeddings endpoint."""

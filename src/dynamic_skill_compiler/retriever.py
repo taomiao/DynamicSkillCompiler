@@ -4,10 +4,9 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Protocol
+from typing import Dict, List, Protocol
 
-from skillnet_ai.compiler.models import QueryPlan, SkillAsset
-from skillnet_ai.searcher import SkillNetSearcher
+from dynamic_skill_compiler.models import QueryPlan, SkillAsset
 
 
 GENERIC_CAPABILITY_STOPWORDS = {
@@ -46,81 +45,6 @@ class CompositeSkillRetriever:
             for skill in retriever.retrieve(query_plan):
                 merged.setdefault(skill.skill_id, skill)
         return list(merged.values())
-
-
-@dataclass
-class SkillNetSearchRetriever:
-    searcher: SkillNetSearcher = field(default_factory=SkillNetSearcher)
-    limit: int = 20
-    threshold: float = 0.7
-
-    def retrieve(self, query_plan: QueryPlan) -> List[SkillAsset]:
-        skills: Dict[str, SkillAsset] = {}
-        for mode, query in self._queries(query_plan):
-            try:
-                results = self.searcher.search(
-                    q=query,
-                    mode=mode,
-                    limit=self.limit,
-                    threshold=self.threshold,
-                )
-            except Exception:
-                continue
-
-            for result in results:
-                skill = SkillAsset(
-                    skill_id=self._safe_id(getattr(result, "skill_url", None), getattr(result, "skill_name", "skill")),
-                    name=getattr(result, "skill_name", "unknown"),
-                    description=getattr(result, "skill_description", "") or "",
-                    category=getattr(result, "category", None),
-                    source="skillnet_search",
-                    location=getattr(result, "skill_url", None),
-                    capabilities=self._extract_capabilities(
-                        getattr(result, "skill_name", ""),
-                        getattr(result, "skill_description", "") or "",
-                    ),
-                    quality_scores=self._quality_scores(getattr(result, "evaluation", None)),
-                    token_cost=0.0,
-                    execution_cost=max(0.0, 10.0 - float(getattr(result, "stars", 0)) / 50.0),
-                    latency_ms=200.0,
-                    instructions=[getattr(result, "skill_description", "") or ""],
-                )
-                skills.setdefault(skill.skill_id, skill)
-        return list(skills.values())
-
-    def _queries(self, query_plan: QueryPlan) -> List[tuple]:
-        queries = []
-        if query_plan.keyword_query:
-            queries.append(("keyword", query_plan.keyword_query))
-        for item in query_plan.semantic_queries:
-            queries.append(("vector", item))
-        deduped = []
-        seen = set()
-        for query in queries:
-            if query in seen:
-                continue
-            seen.add(query)
-            deduped.append(query)
-        return deduped
-
-    def _safe_id(self, location: Optional[str], name: str) -> str:
-        return re.sub(r"[^a-z0-9_.-]+", "-", (location or name).lower()).strip("-")
-
-    def _extract_capabilities(self, name: str, description: str) -> set[str]:
-        return _extract_capabilities(name, description)
-
-    def _quality_scores(self, evaluation: Optional[dict]) -> Dict[str, float]:
-        if not isinstance(evaluation, dict):
-            return {}
-        mapping = {"good": 1.0, "average": 0.6, "poor": 0.2}
-        scores: Dict[str, float] = {}
-        for key, value in evaluation.items():
-            if not isinstance(value, dict):
-                continue
-            level = str(value.get("level", "")).lower()
-            if level in mapping:
-                scores[key] = mapping[level]
-        return scores
 
 
 @dataclass

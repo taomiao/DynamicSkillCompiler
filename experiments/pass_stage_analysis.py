@@ -9,15 +9,15 @@ from statistics import mean
 
 
 ROOT = Path(__file__).resolve().parent
-SKILLNET_SRC = ROOT.parent / "skillnet-ai" / "src"
+DSC_SRC = ROOT.parent / "src"
 if str(ROOT) in sys.path:
     sys.path.remove(str(ROOT))
 sys.path.insert(0, str(ROOT))
-if str(SKILLNET_SRC) in sys.path:
-    sys.path.remove(str(SKILLNET_SRC))
-sys.path.insert(0, str(SKILLNET_SRC))
+if str(DSC_SRC) in sys.path:
+    sys.path.remove(str(DSC_SRC))
+sys.path.insert(0, str(DSC_SRC))
 
-from skillnet_ai.compiler import (  # noqa: E402
+from dynamic_skill_compiler import (  # noqa: E402
     CompilerConfig,
     DEFAULT_GRAPH_PASSES,
     DynamicSkillCompiler,

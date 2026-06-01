@@ -7,7 +7,7 @@ from experiments.src.runtime_recompile import (
     RuntimeRecompileController,
     execute_compiled_procedure,
 )
-from skillnet_ai.compiler import (
+from dynamic_skill_compiler import (
     CompilerConfig,
     GRAPH_PASS_PRESETS,
     DynamicSkillCompiler,

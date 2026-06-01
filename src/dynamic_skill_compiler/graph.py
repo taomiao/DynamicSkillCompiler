@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import re
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-from skillnet_ai.compiler.models import (
+from dynamic_skill_compiler.models import (
     CompilationMetrics,
     CompiledSkill,
     CompiledSkillPackage,
