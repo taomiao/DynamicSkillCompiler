@@ -79,6 +79,11 @@ Your task is to create a structured "Procedural Guidance" text. This text will s
 20. **Soft Descriptor Evidence**: Treat descriptive preferences such as style, fit, use case, quality adjectives, or speed as soft evidence unless the task explicitly marks them mandatory. Do not reject an otherwise strong candidate only because surface text lacks a soft descriptor; inspect the candidate state/details/options first, and commit when hard constraints have evidence and there is no direct contradiction.
 21. **Explicit Option Commitment**: If the task states an explicit attribute value (for example color, size, target state, destination, tool, or variant) and the current environment exposes that value as a selectable/actionable option, select or apply that exact option before the final commit. Prior search terms, object labels, or earlier observations are not enough evidence to skip an available explicit option.
 22. **Evidence Staging**: On discovery/list/search pages, use only coarse identity/type and directly visible hard constraints to decide whether to inspect. Do not require surface text to contain fine-grained attributes such as color, size, material, care instructions, destination, or other option-like values; verify those on inspection/state pages before rejecting a plausible candidate.
+23. **Hard-vs-Soft Best Effort**: Name hard constraints separately from soft evidence. After a bounded search/inspection budget, choose or verify the best-so-far candidate that satisfies hard constraints rather than emitting no-op/failure language while legal actions remain.
+24. **Single-Step Action Contract**: Procedural guidance must tell the agent to emit exactly one environment action per turn. Do not write examples that bundle several `Action:` lines together; multi-step sequences must be expressed as ordered next turns after fresh observations.
+25. **Latest-State Authority**: Every candidate, object, option, destination, or tool must be actionable in the latest observation before using it. If the state changed, first navigate/observe/refresh, then act from the refreshed legal action space.
+26. **No Keyword-Checklist Rejection**: Do not write result/list filtering rules that require a surface title/label to contain every requested attribute. A title/label may be incomplete. Use a small score or shortlist based on coarse type plus any visible hard constraints, inspect the strongest candidates, and reject only after inspection gives contradictory evidence.
+27. **No Premature Failure Language**: Avoid instructions such as "report no match", "abort", or "terminate" until the action budget is exhausted or the environment has no legal candidate/commit actions. Prefer a concrete inspect, navigate, relax-soft-evidence, or best-so-far commit action.
 
 # Input Data
 1.  **Task Description:**
@@ -169,6 +174,7 @@ Use extended reasoning internally, then produce a short Analysis and a single re
 - Remove **verbatim** duplicate bullets; merge two bullets that prescribe the identical action.
 - Shorten prose while keeping the same action sequence and preconditions.
 - Add **at most one** bullet of generic error recovery if the draft completely omits ambiguity handling and the skills imply disambiguation.
+- Add generic DSC execution safeguards when missing: one environment action per turn, latest-observation authority for legal targets, and hard-vs-soft best-effort commitment after bounded exploration.
 
 # Forbidden edits
 - Inventing a new multi-phase strategy not present in the draft.
@@ -210,6 +216,7 @@ Rules:
 - Each bullet is one actionable reminder (no full phases, no repeating steps already spelled out in the draft).
 - Do not contradict the draft’s phase order or task milestones.
 - No pseudo-code or `ERROR:` lines.
+- Prefer generic DSC safeguards over benchmark-specific tactics: one legal action per turn, act only from the latest observation, preserve hard constraints, relax soft evidence after bounded exploration, and commit/verify best-so-far instead of no-op failure language.
 
 Output format (mandatory, single block):
 <Refiner_Addendum>
@@ -281,28 +288,47 @@ Your task is to implement a Python function `overall_procedure_code` that follow
     and inspect the strongest partial candidate after limited horizontal exploration or
     one relaxed query; verify state/details/options before rejecting it. Never terminate
     with an empty action when legal candidate or commit actions remain.
-10. **Silent Commit Actions**: Some legal selection/commit actions do not visibly change
+10. **Hard-vs-Soft Best Effort**: Separate constraints that are explicitly required for
+    task validity from softer descriptive evidence. Preserve hard constraints, but after
+    bounded exploration without a perfect match, choose the best-so-far candidate that
+    satisfies the hard constraints instead of emitting `none`, `done`, or a failure report.
+    A partial but executable commit is better than exhausting the budget while searching
+    for unobserved soft evidence.
+11. **Single-Step Action Contract**: Each loop iteration must execute exactly one legal
+    environment action. If the assistant response contains several `Action:` lines or a
+    plan with multiple actions, execute only the first currently legal action, append the
+    resulting observation, then ask for the next action from the updated state. Never
+    assume later actions in the same response have already happened.
+12. **Latest-State Authority**: Treat the latest observation as the only authority for
+    currently legal/reachable targets. If a planned target is absent from the latest state,
+    first navigate, refresh, inspect, or choose a visible alternative; do not use stale
+    target ids/names from earlier pages or rooms as if they were still actionable.
+13. **Silent Commit Actions**: Some legal selection/commit actions do not visibly change
     the observation text. If a different legal option/action was just selected and no
     explicit error appears, proceed to the next required selection or final commit instead
     of treating the unchanged observation as failure.
-11. **Explicit Option Commitment**: If the task specifies an explicit attribute/state and
+14. **Explicit Option Commitment**: If the task specifies an explicit attribute/state and
     the current observation exposes it as a legal selectable option/action, select/apply it
     before the final commit/delivery/placement/action. Do not skip the option just because
     a prior query, label, or observation already mentioned it.
-12. **Evidence Staging**: On discovery/list/search pages, filter only by coarse identity/type
+15. **Evidence Staging**: On discovery/list/search pages, filter only by coarse identity/type
     and directly visible hard constraints. Do not reject plausible candidates because
     fine-grained attributes or option-like values are absent from surface text; inspect
     state/details/options first, then reject only with fresh contradictory evidence.
-13. **Reward Field Safety**: When reading score/reward metadata from `env.step(...)`,
+16. **No Keyword-Checklist Rejection**: Generated code and injected guidance must not
+    require every requested fine-grained attribute to appear in a surface title/label
+    before inspection. Use a coarse shortlist or best-so-far ranking; missing surface
+    keywords are unknown evidence, not contradiction.
+17. **Reward Field Safety**: When reading score/reward metadata from `env.step(...)`,
     use safe `dict.get(...)` access after confirming `info` is a dict. For scalar scores,
     use `info.get("score", task_reward)`. For list-style success flags, use
     `info.get("won", [reward])`. Never use `info["score"]`, `info['score']`,
     `info["won"]`, or `info['won']`, because some environment or abort paths omit them.
-14. **Done Field Safety**: Environment done flags may be either a scalar boolean or a
+18. **Done Field Safety**: Environment done flags may be either a scalar boolean or a
     single-element list/tuple depending on whether the raw environment or a runtime proxy
     is executing the generated code. Normalize with an `isinstance(..., (list, tuple))`
     check before indexing; never assume `task_done[0]` is always valid.
-15. **Function Naming**: Name the function `overall_procedure_code` as per the template.
+19. **Function Naming**: Name the function `overall_procedure_code` as per the template.
 {recompile_note}
 
 # Input Data

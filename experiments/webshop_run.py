@@ -38,15 +38,21 @@ from web_agent_site.utils import DEFAULT_FILE_PATH
 
 
 client = None
+client_config = None
 
 
 def get_client():
-    global client
-    if client is None:
+    global client, client_config
+    timeout_seconds = float(os.environ.get("EXPERIMENT_LLM_TIMEOUT_SECONDS", "180"))
+    config = (os.environ["API_KEY"], os.environ["BASE_URL"], timeout_seconds)
+    if client is None or client_config != config:
         client = OpenAI(
-            api_key=os.environ["API_KEY"],
-            base_url=os.environ["BASE_URL"]
+            api_key=config[0],
+            base_url=config[1],
+            timeout=config[2],
+            max_retries=0,
         )
+        client_config = config
     return client
 
 

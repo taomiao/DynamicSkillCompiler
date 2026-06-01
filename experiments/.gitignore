@@ -1,2 +1,9 @@
 __pycache__/
 .DS_Store
+ScienceWorld/
+WebShop/
+alfworld/
+results/
+hs_err_pid*.log
+object_type_ids.tsv
+2026-*-this-session-is-being-continued-from-a-previous-c.txt

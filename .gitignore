@@ -3,3 +3,6 @@ __pycache__/
 skill_downloads/
 download_skill*
 .DS_Store
+.env
+.cache/
+object_type_ids.tsv

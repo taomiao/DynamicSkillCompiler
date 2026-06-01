@@ -115,8 +115,8 @@ def _resolve_ambiguous_action(action: str, last_observation: str) -> str:
 
 def _scienceworld_strip_parenthetical_objects(action: str) -> str:
     """
-    ScienceWorld often rejects actions that copy parenthetical text from observations
-    (e.g. 'pick up tin cup (containing red paint)'). Strip those qualifiers for common verbs.
+    ScienceWorld often rejects actions that copy parenthetical text from observations.
+    Strip those qualifiers for common verbs.
     """
     s = (action or "").strip()
     if "(" not in s:
@@ -199,6 +199,25 @@ def parse_action(response: str, last_observation: str = "") -> str:
     obs = last_observation or ""
     if "Ambiguous request" not in obs and "Please enter the number" not in obs:
         action = _scienceworld_strip_parenthetical_objects(action)
+    return _resolve_ambiguous_action(action, last_observation)
+
+
+def parse_action_for_runtime_proxy(response: str, last_observation: str = "") -> str:
+    """
+    Preserve observation-only qualifiers for RuntimeRecompileEnvProxy.
+
+    The proxy can use raw intent descriptors to resolve same-name ambiguity,
+    then strip the action before env.step. The standard parser keeps stripping
+    these details for direct env execution.
+    """
+    pattern = re.compile(r"Action:\s*(.+)", re.IGNORECASE)
+    match = pattern.search(response)
+    if match:
+        action = match.group(1).strip().strip('"\'*`')
+    else:
+        stripped = response.strip().strip('"\'*`')
+        action = stripped if re.fullmatch(r"\d+", stripped) else ""
+    action = _normalize_indexed_object_guess(action, last_observation)
     return _resolve_ambiguous_action(action, last_observation)
 
 
@@ -330,7 +349,7 @@ def _invoke_compiled_scienceworld(func, env, model, messages, remaining_steps):
         env,
         llm,
         model,
-        parse_action,
+        parse_action_for_runtime_proxy,
         messages,
         remaining_steps,
     )

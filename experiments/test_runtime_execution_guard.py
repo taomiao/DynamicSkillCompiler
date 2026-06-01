@@ -12,6 +12,8 @@ from runtime_recompile import (
     classify_runtime_failure,
     infer_runtime_protocol_hints,
 )
+from prompt_generator import generate_overall_procedure_code_prompt
+from prompt_generator import generate_overall_procedure_prompt
 
 
 def _adapter(action, result):
@@ -33,10 +35,16 @@ class _Env:
         return "Nothing happens.", 0.0, False, {}
 
 
+class _OkEnv(_Env):
+    def step(self, action):
+        self.actions.append(action)
+        return "You selected an option.", 0.0, False, {}
+
+
 def test_classifies_skill_name_as_action():
     result = classify_runtime_failure(
-        action="use alfworld-object-locator",
-        selected_skill_names=["alfworld-object-locator"],
+        action="use object-locator",
+        selected_skill_names=["object-locator"],
     )
     assert result["failure_type"] == "skill_as_action"
 
@@ -44,8 +52,7 @@ def test_classifies_skill_name_as_action():
 def test_classifies_script_tool_as_action():
     result = classify_runtime_failure(
         action="parse_query.py",
-        benchmark="webshop",
-        selected_skill_names=["webshop-query-parser"],
+        selected_skill_names=["query-parser"],
     )
     assert result["failure_type"] == "skill_as_action"
 
@@ -53,16 +60,16 @@ def test_classifies_script_tool_as_action():
 def test_runtime_guard_blocks_skill_action_before_env_step():
     env = _Env()
     controller = RuntimeRecompileController(
-        benchmark="alfworld",
+        benchmark="generic",
         enabled=True,
-        selected_skill_names=["alfworld-object-locator"],
+        selected_skill_names=["object-locator"],
         max_total_steps=10,
         min_steps_between_recompiles=1,
     )
-    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="alfworld")
+    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="generic")
 
     try:
-        proxy.step(["use alfworld-object-locator"])
+        proxy.step(["use object-locator"])
     except RuntimeSkillRecompileRequested as exc:
         decision = exc.decision.to_dict()
         assert decision["failure_type"] == "skill_as_action"
@@ -76,18 +83,18 @@ def test_runtime_guard_blocks_skill_action_before_env_step():
 def test_placeholder_action_gets_one_soft_hint_before_recompile():
     env = _Env()
     controller = RuntimeRecompileController(
-        benchmark="webshop",
+        benchmark="generic",
         enabled=True,
         selected_skill_names=[],
         max_total_steps=10,
         min_steps_between_recompiles=1,
     )
-    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="webshop")
-    proxy._update_context("", "Product page [SEP] Buy Now")
+    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="generic")
+    proxy._update_context("", "A state with one available final action.")
 
     observation, reward, done, info = proxy.step(["none"])
     assert "Runtime guard hint" in observation
-    assert "click[Buy Now]" in observation
+    assert "Continue with one concrete legal environment action" in observation
     assert reward == 0.0
     assert done is False
     assert info["runtime_guard_hint"] is True
@@ -105,29 +112,34 @@ def test_placeholder_action_gets_one_soft_hint_before_recompile():
     assert env.actions == []
 
 
-def test_webshop_repairs_title_click_to_asin():
-    env = _Env()
-    controller = RuntimeRecompileController(
-        benchmark="webshop",
-        enabled=True,
-        selected_skill_names=[],
-        max_total_steps=10,
+def test_dsc_generation_prompt_contains_generic_execution_contract():
+    procedure_messages = generate_overall_procedure_prompt(
+        "Find or transform the target.",
+        "Example procedure.",
+        "Skill contents.",
     )
-    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="webshop")
-    proxy._update_context(
-        "",
-        "Page 1 [SEP] B09PVNLVRW [SEP] Women's V-Neck Rompers Printed Jumpsuit Long Sleeve Homewear [SEP] $17.4 [SEP] Next >",
+    procedure_text = procedure_messages[-1]["content"]
+    assert "Hard-vs-Soft Best Effort" in procedure_text
+    assert "Single-Step Action Contract" in procedure_text
+    assert "Latest-State Authority" in procedure_text
+    assert "No Keyword-Checklist Rejection" in procedure_text
+
+    prompt_messages = generate_overall_procedure_code_prompt(
+        "Find or transform the target.",
+        "Use available evidence and proceed safely.",
+        "def overall_procedure_code(env, llm, model, parse_action, messages=[], max_steps=30):\n    pass",
     )
-    repaired = proxy._repair_action(
-        "click[Women's V-Neck Rompers Printed Jumpsuit Long Sleeve Homewear]"
-    )
-    assert repaired == "click[B09PVNLVRW]"
-    assert proxy._repair_action("click[next]") == "click[Next >]"
+    prompt_text = prompt_messages[-1]["content"]
+    assert "Single-Step Action Contract" in prompt_text
+    assert "Latest-State Authority" in prompt_text
+    assert "Hard-vs-Soft Best Effort" in prompt_text
+    assert "No Keyword-Checklist Rejection" in prompt_text
+    assert "execute exactly one legal" in prompt_text
 
 
 def test_observation_failure_gets_precondition_type():
     controller = RuntimeRecompileController(
-        benchmark="alfworld",
+        benchmark="generic",
         enabled=True,
         selected_skill_names=[],
         max_total_steps=10,
@@ -148,7 +160,6 @@ def test_search_failure_gets_search_protocol():
     result = classify_runtime_failure(
         action="search[waterproof hiking shoes size 10 blue]",
         observation="No results found.",
-        benchmark="webshop",
     )
     assert result["failure_type"] == "search_exhausted"
 
@@ -166,19 +177,18 @@ def test_search_failure_gets_search_protocol():
 
 def test_runtime_protocol_state_preserves_hard_constraints_and_candidates():
     state = build_runtime_protocol_state(
-        "Find a product with color: purple, and size: x-large, and price lower than 140 dollars",
+        "Find an item with color: purple, and size: x-large, and price lower than 140 dollars",
         {
             "failure_type": "stagnation",
-            "action": "click[Next >]",
+            "action": "search[purple camera optical zoom]",
             "trace_tail": [
                 {"action": "search[purple camera optical zoom]", "observation": "Page 1"},
-                {"action": "click[Next >]", "observation": "Page 2"},
+                {"action": "look around", "observation": "Candidate list"},
             ],
             "state_snapshot": {
-                "benchmark": "webshop",
-                "webshop_products": [
+                "products": [
                     {
-                        "asin": "B004HO58MA",
+                        "id": "candidate-1",
                         "title": "Purple Digital Camera with Optical Zoom",
                         "price": "$100.0",
                     }
@@ -194,141 +204,14 @@ def test_runtime_protocol_state_preserves_hard_constraints_and_candidates():
     assert "color: purple" in state["evidence_stages"]["detail_page"]
     assert any("select/apply color: purple" in item for item in state["evidence_stages"]["final_commit"])
     assert state["phase"] == "inspect_or_commit_best_candidate"
-    assert any("B004HO58MA" in candidate for candidate in state["candidates"])
+    assert any("candidate-1" in candidate for candidate in state["candidates"])
     assert any("Preserve hard constraints" in item for item in state["next_policy"])
-
-
-def test_webshop_search_gets_commitment_protocol():
-    hints = infer_runtime_protocol_hints(
-        "WebShop [SEP] Instruction: Find a black jumpsuit under 60 [SEP] Search",
-        {
-            "failure_type": "exploration_without_commit",
-            "action": "click[Next >]",
-            "observation": "Page 3 (Total results: 50) [SEP] B123 [SEP] Black Romper [SEP] $19.99",
-            "trace_tail": [
-                {"action": "click[Next >]", "observation": "Page 2"},
-                {"action": "click[Next >]", "observation": "Page 3"},
-            ],
-        },
-    )
-    assert any("candidate queue" in hint for hint in hints)
-    assert any("best-so-far candidate" in hint for hint in hints)
-    assert not any("1-2 result pages" in hint for hint in hints)
-
-
-def test_exploration_commit_guard_is_progress_based_not_page_based():
-    controller = RuntimeRecompileController(
-        benchmark="webshop",
-        enabled=True,
-        selected_skill_names=[],
-        max_total_steps=20,
-        min_steps_between_recompiles=1,
-        exploration_commit_enabled=True,
-        exploration_commit_threshold=3,
-    )
-    product_snapshot = {
-        "webshop_products": [
-            {"asin": "B09PVNLVRW", "title": "Black Romper", "price": "$19.99"}
-        ]
-    }
-
-    assert controller.record_step(
-        action="search[black romper under 60]",
-        observation="Page 1 [SEP] B09PVNLVRW [SEP] Black Romper [SEP] $19.99",
-        task_done=False,
-        task_reward=0.0,
-        state_snapshot=product_snapshot,
-    ) is None
-    assert controller.record_step(
-        action="click[Next >]",
-        observation="Page 2 [SEP] B09PVNLVRW [SEP] Black Romper [SEP] $19.99",
-        task_done=False,
-        task_reward=0.0,
-        state_snapshot=product_snapshot,
-    ) is None
-    decision = controller.record_step(
-        action="search[black jumpsuit under 60]",
-        observation="Page 1 [SEP] B09PVNLVRW [SEP] Black Romper [SEP] $19.99",
-        task_done=False,
-        task_reward=0.0,
-        state_snapshot=product_snapshot,
-    )
-    assert decision is not None
-    assert decision.reason == "exploration_without_commit"
-    assert decision.failure_type == "exploration_without_commit"
-
-    controller = RuntimeRecompileController(
-        benchmark="webshop",
-        enabled=True,
-        selected_skill_names=[],
-        max_total_steps=20,
-        min_steps_between_recompiles=1,
-        exploration_commit_enabled=True,
-        exploration_commit_threshold=3,
-    )
-    assert controller.record_step(
-        action="search[black romper under 60]",
-        observation="Page 1 [SEP] B09PVNLVRW [SEP] Black Romper [SEP] $19.99",
-        task_done=False,
-        task_reward=0.0,
-        state_snapshot=product_snapshot,
-    ) is None
-    assert controller.record_step(
-        action="click[B09PVNLVRW]",
-        observation="Product page [SEP] Buy Now",
-        task_done=False,
-        task_reward=0.0,
-        state_snapshot={},
-    ) is None
-    assert controller.horizontal_exploration_count == 0
-
-
-def test_silent_distinct_commit_actions_do_not_trigger_stagnation():
-    controller = RuntimeRecompileController(
-        benchmark="webshop",
-        enabled=True,
-        selected_skill_names=[],
-        max_total_steps=20,
-        min_steps_between_recompiles=1,
-        stagnation_threshold=1,
-    )
-    product_page = {
-        "benchmark": "webshop",
-        "webshop_products": [],
-    }
-    observation = "Product page [SEP] color [SEP] black [SEP] size [SEP] x-large [SEP] Buy Now"
-
-    assert controller.record_step(
-        action="click[black]",
-        observation=observation,
-        task_done=False,
-        task_reward=0.0,
-        state_snapshot=product_page,
-    ) is None
-    assert controller.record_step(
-        action="click[x-large]",
-        observation=observation,
-        task_done=False,
-        task_reward=0.0,
-        state_snapshot=product_page,
-    ) is None
-
-    decision = controller.record_step(
-        action="click[x-large]",
-        observation=observation,
-        task_done=False,
-        task_reward=0.0,
-        state_snapshot=product_page,
-    )
-    assert decision is not None
-    assert decision.reason == "action_loop"
 
 
 def test_transform_failure_gets_transform_protocol():
     result = classify_runtime_failure(
         action="cool potato 1 with fridge 1",
         observation="Nothing happens.",
-        benchmark="alfworld",
     )
     assert result["failure_type"] == "transformation_precondition_missing"
 
@@ -346,17 +229,183 @@ def test_transform_failure_gets_transform_protocol():
     assert any("one-at-a-time" in hint for hint in hints)
 
 
+def test_proxy_resolves_ambiguous_followup_before_env_step():
+    env = _OkEnv()
+    controller = RuntimeRecompileController(
+        benchmark="generic",
+        enabled=True,
+        selected_skill_names=[],
+        max_total_steps=10,
+        min_steps_between_recompiles=1,
+    )
+    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="generic")
+    proxy._update_context(
+        "",
+        (
+            "Ambiguous request: Please enter the number for the action you intended "
+            "(or blank to cancel):\n"
+            "0:\tfocus on lemon seed (in flower pot 1, in greenhouse)\n"
+            "1:\tfocus on lemon seed (in flower pot 2, in greenhouse)"
+        ),
+    )
+
+    proxy.step("focus on lemon seed")
+    assert env.actions == ["0"]
+
+
+def test_proxy_blocks_orphan_ambiguous_index():
+    env = _Env()
+    controller = RuntimeRecompileController(
+        benchmark="generic",
+        enabled=True,
+        selected_skill_names=[],
+        max_total_steps=10,
+        min_steps_between_recompiles=1,
+    )
+    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="generic")
+    proxy._update_context("", "This room is called the greenhouse. In it, you see a seed jar.")
+
+    observation, reward, done, info = proxy.step("0")
+    assert "numeric index is only legal" in observation
+    assert reward == 0.0
+    assert done is False
+    assert info["runtime_guard_hint"] is True
+    assert env.actions == []
+
+
+def test_proxy_does_not_force_unrelated_action_into_ambiguous_index():
+    env = _OkEnv()
+    controller = RuntimeRecompileController(
+        benchmark="generic",
+        enabled=True,
+        selected_skill_names=[],
+        max_total_steps=10,
+        min_steps_between_recompiles=1,
+    )
+    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="generic")
+    proxy._update_context(
+        "",
+        (
+            "Ambiguous request: Please enter the number for the action you intended "
+            "(or blank to cancel):\n"
+            "0:\tinspect sample vial (in inventory)\n"
+            "1:\tinspect sample vial (on shelf)"
+        ),
+    )
+
+    observation, _reward, _done, info = proxy.step("look around")
+    assert "waiting for a numeric index" in observation
+    assert info["runtime_guard_hint"] is True
+    assert env.actions == []
+
+
+def test_proxy_uses_identity_ledger_for_same_name_ambiguity():
+    env = _OkEnv()
+    controller = RuntimeRecompileController(
+        benchmark="generic",
+        enabled=True,
+        selected_skill_names=[],
+        max_total_steps=10,
+        min_steps_between_recompiles=1,
+    )
+    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="generic")
+    proxy._update_context(
+        "",
+        (
+            "a storage shelf. On the storage shelf is: "
+            "a sample vial (containing blue reagent), a sample vial (containing red reagent), "
+            "a sample vial (containing yellow reagent)."
+        ),
+    )
+    proxy._update_context(
+        "",
+        (
+            "Ambiguous request: Please enter the number for the action you intended "
+            "(or blank to cancel):\n"
+            "0:\tpick up sample vial (on storage shelf)\n"
+            "1:\tpick up sample vial (on storage shelf)\n"
+            "2:\tpick up sample vial (on storage shelf)"
+        ),
+    )
+
+    proxy.step("pick up sample vial (containing red reagent)")
+    assert env.actions == ["1"]
+
+
+def test_proxy_corrects_numeric_choice_from_pending_ambiguous_intent():
+    env = _OkEnv()
+    controller = RuntimeRecompileController(
+        benchmark="generic",
+        enabled=True,
+        selected_skill_names=[],
+        max_total_steps=10,
+        min_steps_between_recompiles=1,
+    )
+    proxy = RuntimeRecompileEnvProxy(env, controller, _adapter, benchmark="generic")
+    proxy._update_context(
+        "",
+        (
+            "This work area contains: "
+            "a sample vial (containing red reagent), a sample vial (containing blue reagent)."
+        ),
+    )
+    proxy._last_raw_action_intent = "pick up sample vial (containing blue reagent)"
+    proxy._update_context(
+        "pick up sample vial",
+        (
+            "Ambiguous request: Please enter the number for the action you intended "
+            "(or blank to cancel):\n"
+            "0:\tpick up sample vial (in work area)\n"
+            "1:\tpick up sample vial (in work area)"
+        ),
+    )
+
+    proxy.step("0")
+    assert env.actions == ["1"]
+
+
+def test_runtime_protocol_state_includes_state_ledger():
+    state = build_runtime_protocol_state(
+        "Measure the target and place it in the correct box.",
+        {
+            "failure_type": "reward_plateau",
+            "action": "look around",
+            "observation": "You see two boxes.",
+            "state_snapshot": {
+                "benchmark": "generic",
+                "completed_actions": [
+                    {"action": "pick up thermometer", "observation": "You move the thermometer to inventory."}
+                ],
+                "focused_targets": ["unknown substance b"],
+                "last_measurements": [
+                    {"action": "use thermometer on unknown substance b", "value": "20"}
+                ],
+                "ambiguous_options": [{"index": "0", "text": "focus on seed"}],
+            },
+        },
+    )
+
+    assert state["completed_actions"]
+    assert state["focused_targets"] == ["unknown substance b"]
+    assert state["last_measurements"][0]["value"] == "20"
+    assert state["ambiguous_options"][0]["index"] == "0"
+    assert any("state ledger" in item for item in state["next_policy"])
+
+
 if __name__ == "__main__":
     test_classifies_skill_name_as_action()
     test_classifies_script_tool_as_action()
     test_runtime_guard_blocks_skill_action_before_env_step()
     test_placeholder_action_gets_one_soft_hint_before_recompile()
-    test_webshop_repairs_title_click_to_asin()
+    test_dsc_generation_prompt_contains_generic_execution_contract()
     test_observation_failure_gets_precondition_type()
     test_search_failure_gets_search_protocol()
     test_runtime_protocol_state_preserves_hard_constraints_and_candidates()
-    test_webshop_search_gets_commitment_protocol()
-    test_exploration_commit_guard_is_progress_based_not_page_based()
-    test_silent_distinct_commit_actions_do_not_trigger_stagnation()
     test_transform_failure_gets_transform_protocol()
+    test_proxy_resolves_ambiguous_followup_before_env_step()
+    test_proxy_blocks_orphan_ambiguous_index()
+    test_proxy_does_not_force_unrelated_action_into_ambiguous_index()
+    test_proxy_uses_identity_ledger_for_same_name_ambiguity()
+    test_proxy_corrects_numeric_choice_from_pending_ambiguous_intent()
+    test_runtime_protocol_state_includes_state_ledger()
     print("runtime execution guard tests passed")

@@ -125,7 +125,6 @@ def _classify_failure_modes(domain: str, row: dict[str, Any], texts: list[str]) 
     joined = "\n".join(texts[-12:])
     query = str(row.get("query", ""))
     actions = _last_actions(texts, limit=10)
-    observations = _last_observations(texts, limit=4)
     evidence: list[str] = []
     modes: list[str] = []
 
@@ -136,46 +135,28 @@ def _classify_failure_modes(domain: str, row: dict[str, Any], texts: list[str]) 
                 modes.append(f"runtime_{event['reason']}")
                 evidence.append(f"Runtime recompile reason: {event['reason']}")
 
-    if domain == "webshop":
-        if _contains_any(joined, ["no results", "not found", "no available products", "no viable matches"]):
-            modes.append("webshop_search_dead_end")
-            evidence.append("Trace reports no viable products or no results after search/relaxation.")
-        if actions and actions[-1].lower() in {"none", "stop"}:
-            modes.append("webshop_abstained_after_results")
-            evidence.append("Final action abstained instead of clicking a candidate or revising search.")
-        if "price lower than" in query.lower() or "price less than" in query.lower() or "under " in query.lower():
-            if _contains_any(joined, ["$"]) and not _contains_any(joined, ["buy now", "click[buy now]"]):
-                modes.append("webshop_price_constraint_selection")
-                evidence.append("Price constraint present; trace reached priced listings without purchase.")
-        if _contains_any(joined, ["page 2", "next >"]) and not _contains_any(joined, ["click[", "click ["]):
-            modes.append("webshop_pagination_without_commit")
-            evidence.append("Agent paginated through results but did not commit to inspecting a product.")
-
-    elif domain == "alfworld":
-        if _contains_any(joined, ["you can't see", "there is no", "not carrying", "nothing happens"]):
-            modes.append("alfworld_action_grounding_failure")
-            evidence.append("Trace contains environment rejection for object/action grounding.")
-        if _contains_any(joined, ["ambiguous request", "please enter the number"]):
-            modes.append("alfworld_ambiguity_loop")
-            evidence.append("Trace contains ambiguous-object prompt.")
-        if _contains_any(query, ["clean", "heat", "cool"]):
-            modes.append("alfworld_transform_precondition_failure")
-            evidence.append("Task requires object transformation before final placement.")
-
-    elif domain == "scienceworld":
-        if _contains_any(joined, ["not valid", "unknown action", "nothing happens", "you don't see"]):
-            modes.append("scienceworld_action_syntax_failure")
-            evidence.append("Trace contains ScienceWorld action/syntax rejection.")
-        if _contains_any(query, ["focus on", "focus"]):
-            modes.append("scienceworld_focus_milestone_failure")
-            evidence.append("Task likely requires exact focus milestone handling.")
-        if _contains_any(query, ["temperature", "thermometer", "conductive", "conductivity"]):
-            modes.append("scienceworld_instrument_workflow_failure")
-            evidence.append("Task requires instrument/circuit workflow coordination.")
+    if _contains_any(joined, ["no results", "not found", "no available", "no viable matches", "no matches"]):
+        modes.append("search_dead_end")
+        evidence.append("Trace reports no viable candidates after search or relaxation.")
+    if actions and actions[-1].lower() in {"none", "stop", "null"}:
+        modes.append("abstained_while_incomplete")
+        evidence.append("Final action abstained instead of continuing with a concrete environment action.")
+    if _contains_any(joined, ["can't", "cannot", "not valid", "unknown action", "nothing happens", "you don't see", "there is no"]):
+        modes.append("action_grounding_failure")
+        evidence.append("Trace contains environment rejection for action syntax, target grounding, or missing preconditions.")
+    if _contains_any(joined, ["ambiguous request", "please enter the number"]):
+        modes.append("ambiguity_loop")
+        evidence.append("Trace contains an unresolved ambiguous-choice prompt.")
+    if _contains_any(query, ["clean", "heat", "cool", "wash", "slice", "toggle", "turn on", "turn off"]):
+        modes.append("transform_precondition_failure")
+        evidence.append("Task requires an object/state transformation with explicit preconditions.")
+    if _contains_any(joined, ["same observation", "repeated", "stagnation"]) or len(set(actions[-4:])) < len(actions[-4:]):
+        modes.append("stagnation_or_action_loop")
+        evidence.append("Recent trace repeats actions or observations without new progress.")
 
     if not modes:
-        modes.append(f"{domain}_low_reward_generic")
-        evidence.append("Case failed or scored low without a domain-specific signature.")
+        modes.append("low_reward_generic")
+        evidence.append("Case failed or scored low without a specific portable signature.")
 
     return list(dict.fromkeys(modes)), list(dict.fromkeys(evidence))
 
@@ -226,122 +207,43 @@ def collect_failure_cases(
 
 def _proposal_target(domain: str, mode: str, selected_skills: Counter[str]) -> tuple[str, str]:
     preferred = selected_skills.most_common()
-    selected_names = {name for name, _ in preferred}
-
-    def choose(candidates: list[str], fallback: str) -> str:
-        for candidate in candidates:
-            if candidate in selected_names:
-                return candidate
-        return fallback
-
-    if domain == "webshop":
-        if mode in {"webshop_search_dead_end", "webshop_pagination_without_commit"}:
-            target = choose(
-                ["webshop-search-formulator", "webshop-search-constructor", "webshop-result-page-navigator"],
-                "webshop-search-formulator",
-            )
-            return "edit_existing_skill", target
-        if mode == "webshop_price_constraint_selection":
-            target = choose(["webshop-price-checker", "webshop-result-filter"], "webshop-price-checker")
-            return "edit_existing_skill", target
-        if mode == "webshop_abstained_after_results":
-            target = choose(["webshop-result-analyzer", "webshop-product-selector"], "webshop-result-analyzer")
-            return "edit_existing_skill", target
-        return "edit_existing_skill", choose(["webshop-result-filter"], "webshop-result-filter")
-
-    if domain == "alfworld":
-        if mode == "alfworld_ambiguity_loop":
-            return "edit_existing_skill", choose(
-                ["alfworld-ambiguous-action-resolution", "alfworld-object-disambiguator"],
-                "alfworld-ambiguous-action-resolution",
-            )
-        if mode == "alfworld_transform_precondition_failure":
-            return "edit_existing_skill", choose(
-                ["alfworld-object-transformer", "alfworld-heat-object", "alfworld-cool-object", "alfworld-clean-object"],
-                "alfworld-object-transformer",
-            )
-        return "edit_existing_skill", choose(["alfworld-action-grounder"], "alfworld-action-grounder")
-
-    if domain == "scienceworld":
-        if mode == "scienceworld_focus_milestone_failure":
-            return "edit_existing_skill", choose(
-                ["scienceworld-task-focuser", "scienceworld-object-focuser"],
-                "scienceworld-task-focuser",
-            )
-        if mode == "scienceworld_instrument_workflow_failure":
-            return "edit_existing_skill", choose(
-                ["scienceworld-conductivity-tester", "scienceworld-temperature-measurer", "scienceworld-circuit-builder"],
-                "scienceworld-conductivity-tester",
-            )
-        return "edit_existing_skill", choose(["scienceworld-action-syntax"], "scienceworld-action-syntax")
-
+    if preferred:
+        return "edit_existing_skill", preferred[0][0]
     return "create_new_skill", f"{domain}-failure-recovery"
 
 
 def _expected_fix(domain: str, mode: str) -> list[str]:
     fixes = {
-        "webshop_search_dead_end": [
-            "Add a staged query relaxation policy: preserve product type and rare attributes first, then relax noisy adjectives.",
-            "Require a product-detail click before concluding no match when any plausible listing appears under the price limit.",
-            "Record which constraints were intentionally relaxed so the final candidate can be verified against the original request.",
+        "search_dead_end": [
+            "Use staged search recovery: preserve hard constraints, relax only soft descriptors, and record what changed.",
+            "Before declaring failure, inspect or verify any plausible visible candidate with fresh evidence.",
         ],
-        "webshop_abstained_after_results": [
-            "Replace terminal `Action: none` with either a candidate click, a revised search, or a clear fallback purchase policy.",
-            "Rank visible listings by hard constraints first, then soft lexical overlap, then price.",
-            "If no exact match exists, inspect the best partial match instead of looping on the same results page.",
+        "abstained_while_incomplete": [
+            "Replace terminal placeholders with one concrete legal environment action from the latest observation.",
+            "If no exact candidate exists, either broaden search or verify the best partial candidate before stopping.",
         ],
-        "webshop_price_constraint_selection": [
-            "Parse price ranges conservatively using the lowest listed price for search-result triage and detail-page price for final verification.",
-            "Block purchase only when the verified selected variant exceeds the user's maximum price.",
-            "Keep price as a hard constraint while allowing soft attribute relaxation.",
+        "action_grounding_failure": [
+            "After a rejection, refresh state and retry with exact target names/actions from the latest observation.",
+            "Repair only the failed precondition instead of restarting completed subgoals.",
         ],
-        "webshop_pagination_without_commit": [
-            "Set a page budget and click the best candidate seen so far before exhausting the full step budget.",
-            "Carry forward the best candidate across pages with its matched constraints and missing constraints.",
-            "After two pages without exact match, switch from pagination to detail inspection of the best partial candidate.",
+        "ambiguity_loop": [
+            "When the environment asks for a number, answer only the listed number.",
+            "Use object identity evidence such as contents, location, and recent action intent to choose the index.",
         ],
-        "alfworld_action_grounding_failure": [
-            "Require a fresh `look around` after failed object references.",
-            "Use exact numbered object names from the latest observation.",
-            "Repair informal actions into ALFWorld grammar before retrying.",
-        ],
-        "alfworld_ambiguity_loop": [
-            "When the environment asks for a number, answer only the number.",
-            "Prefer the candidate whose receptacle/location matches the current subgoal.",
-            "Avoid restating the ambiguous object name after an ambiguity prompt.",
-        ],
-        "alfworld_transform_precondition_failure": [
+        "transform_precondition_failure": [
             "Separate locate/acquire, transform, verify, and final placement phases.",
-            "Require the appropriate appliance or receptacle before transformation.",
-            "Verify transformed state before moving to the destination.",
+            "Verify required tools, object availability, and state before applying a transform.",
         ],
-        "scienceworld_action_syntax_failure": [
-            "Quote only actions documented by the current ScienceWorld action space.",
-            "After a syntax rejection, inspect the current room and retry with exact object names.",
-            "Avoid invented action verbs in generated procedure examples.",
-        ],
-        "scienceworld_focus_milestone_failure": [
-            "Delay `focus on` until the target object exists in its milestone state.",
-            "Use exact names from the latest observation after state changes or mixtures.",
-            "Add a retry rule for failed focus commands.",
-        ],
-        "scienceworld_instrument_workflow_failure": [
-            "Break instrument setup into explicit locate, assemble, activate/measure, observe, and classify phases.",
-            "For circuits, require exact terminal names from observation.",
-            "Verify instrument output before final placement or answer action.",
+        "stagnation_or_action_loop": [
+            "Track repeated actions and observations, then require a changed target, query, location, or precondition repair.",
+            "Preserve completed subgoals while advancing to the next unresolved step.",
         ],
     }
     return fixes.get(mode, ["Add concrete recovery guidance for this recurring low-reward failure mode."])
 
 
 def _risk(domain: str, mode: str) -> str:
-    if domain == "webshop":
-        return "May over-relax user constraints or click weak partial matches unless final verification is explicit."
-    if domain == "alfworld":
-        return "May overfit to one room/object naming pattern unless examples stay observation-grounded."
-    if domain == "scienceworld":
-        return "May introduce invalid action syntax if examples are not constrained to the environment action space."
-    return "May create redundant broad guidance unless validated against held-out cases."
+    return "May create redundant broad guidance unless validated against held-out cases from multiple environments."
 
 
 def build_proposals(cases: list[FailureCase], *, min_cases_per_proposal: int) -> list[SkillEvolutionProposal]:

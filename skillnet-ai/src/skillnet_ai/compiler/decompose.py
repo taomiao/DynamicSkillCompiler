@@ -100,6 +100,86 @@ class TaskDecomposer:
         return [clause for clause in clauses if clause]
 
     def _infer_environment_hints(self, clause: str, capabilities: Set[str]) -> dict:
+        lowered = clause.lower()
+        caps = {cap.lower() for cap in capabilities}
+
+        scienceworld_terms = {
+            "conductive",
+            "conductivity",
+            "battery",
+            "wire",
+            "thermometer",
+            "workshop",
+            "focus",
+            "box",
+            "boil",
+            "melt",
+            "freeze",
+            "combust",
+            "temperature",
+            "substance",
+        }
+        strong_scienceworld_terms = {
+            "conductive",
+            "conductivity",
+            "battery",
+            "wire",
+            "thermometer",
+            "workshop",
+            "boil",
+            "melt",
+            "freeze",
+            "combust",
+        }
+        scienceworld_phrases = (
+            "state of matter",
+            "degrees celsius",
+            "electrically conductive",
+        )
+        alfworld_terms = {
+            "stoveburner",
+            "microwave",
+            "fridge",
+            "sinkbasin",
+            "cabinet",
+            "drawer",
+            "countertop",
+            "cool",
+            "heat",
+            "clean",
+            "put",
+            "move",
+            "take",
+        }
+        webshop_terms = {
+            "search",
+            "buy",
+            "price",
+            "size",
+            "color",
+            "click",
+            "product",
+            "results",
+            "listing",
+        }
+
+        token_text = " ".join(sorted(caps)) + " " + lowered
+
+        if any(term in token_text for term in webshop_terms):
+            return {"domain": "webshop"}
+        if any(phrase in lowered for phrase in scienceworld_phrases):
+            return {"domain": "scienceworld"}
+        if any(term in lowered for term in {"stoveburner", "microwave", "fridge", "sinkbasin"}):
+            return {"domain": "alfworld"}
+        if (
+            caps & {"cool", "heat", "clean", "wash", "slice"}
+            and not any(term in token_text for term in strong_scienceworld_terms)
+        ):
+            return {"domain": "alfworld"}
+        if any(term in token_text for term in scienceworld_terms):
+            return {"domain": "scienceworld"}
+        if any(term in token_text for term in alfworld_terms):
+            return {"domain": "alfworld"}
         return {"domain": "generic"} if capabilities else {}
 
     def _augment_required_capabilities(self, clause: str, tokens: Set[str]) -> Set[str]:

@@ -17,48 +17,23 @@ FAILURE_PATTERNS = {
         "no known action",
         "don't understand",
         "not sure what you are referring",
-    ),
-    "scienceworld": (
-        "nothing happens",
-        "can't",
-        "cannot",
-        "not possible",
-        "not valid",
-        "unknown action",
-        "no known action",
-        "not sure what you are referring",
-        "you don't see",
-    ),
-    "alfworld": (
-        "nothing happens",
-        "can't",
-        "cannot",
-        "not possible",
-        "not valid",
-        "you are not carrying",
-        "you can't see any such thing",
-        "there is no",
-    ),
-    "webshop": (
-        "invalid action",
-        "not available",
-        "not found",
         "no results",
-        "error",
+        "not found",
+        "no matches",
+        "0 results",
+        "there is no",
+        "you can't see any such thing",
     ),
 }
 
-LOW_CONFIDENCE_FAILURE_PATTERNS = {
-    "alfworld": (
-        "nothing happens",
-    ),
-}
-
+LOW_CONFIDENCE_FAILURE_PATTERNS = {}
 
 AMBIGUOUS_MARKERS = (
     "ambiguous request",
     "please enter the number",
 )
+
+AMBIGUOUS_OPTION_PATTERN = re.compile(r"(\d+):\s*(.*?)(?=\s+\d+:|$)", re.DOTALL)
 
 CAPACITY_MARKERS = (
     "inventory is full",
@@ -78,34 +53,6 @@ SEARCH_EXHAUSTED_MARKERS = (
     "you can't see any such thing",
 )
 
-WEBSHOP_NAV_TARGETS = {
-    "next",
-    ">",
-    "next >",
-    "prev",
-    "< prev",
-    "previous",
-    "back",
-    "back to results",
-    "< back",
-    "< back to results",
-    "back to search",
-    "< back to search",
-}
-
-ALFWORLD_VISIBLE_ENTITY_PATTERN = re.compile(r"\b(?:a|an) ([a-z]+(?: [a-z]+)*) (\d+)\b")
-ALFWORLD_ARRIVAL_PATTERN = re.compile(r"you arrive at ([^.]+)\.", re.IGNORECASE)
-ALFWORLD_PICKUP_PATTERN = re.compile(
-    r"you pick up the ([a-z]+(?: [a-z]+)*) (\d+) from",
-    re.IGNORECASE,
-)
-ALFWORLD_MOVE_PATTERN = re.compile(
-    r"you move the ([a-z]+(?: [a-z]+)*) (\d+) to the ([^.]+)\.",
-    re.IGNORECASE,
-)
-ALFWORLD_OPEN_PATTERN = re.compile(r"you open the ([^.]+)\.", re.IGNORECASE)
-ALFWORLD_CLOSE_PATTERN = re.compile(r"you close the ([^.]+)\.", re.IGNORECASE)
-WEBSHOP_ASIN_PATTERN = re.compile(r"\bB[0-9A-Z]{9}\b")
 PRICE_LIMIT_PATTERN = re.compile(
     r"\b(?:price\s+)?(?:lower than|less than|under|below|at most|no more than)\s+\$?\s*([0-9]+(?:\.[0-9]+)?)",
     re.IGNORECASE,
@@ -195,13 +142,111 @@ def _clean_action_phrase(text: str) -> str:
     return re.sub(r"\s+", " ", _strip_articles(_space_indexed_tokens(text))).strip().lower()
 
 
-def _normalize_webshop_key(text: str) -> str:
+def _strip_parenthetical_details(text: str) -> str:
+    """Remove observation-only qualifiers that are not valid action syntax."""
+    return re.sub(r"\s*\([^)]*\)", "", str(text or "")).strip()
+
+
+def _extract_ambiguous_options(observation: str) -> List[Dict[str, str]]:
+    text = str(observation or "").strip()
+    if text.lower().startswith("observation:"):
+        text = text.split(":", 1)[1].strip()
+    key = _normalize_text(text)
+    if not all(marker in key for marker in AMBIGUOUS_MARKERS):
+        return []
+    compact = re.sub(r"\s+", " ", text)
+    options: List[Dict[str, str]] = []
+    for match in AMBIGUOUS_OPTION_PATTERN.finditer(compact):
+        options.append(
+            {
+                "index": match.group(1).strip(),
+                "text": match.group(2).strip(),
+            }
+        )
+    return options
+
+
+def _resolve_ambiguous_followup(action_text: str, options: Sequence[Dict[str, str]]) -> Optional[str]:
+    """Return the numeric option index for an ambiguous prompt when it is safe."""
+    stripped = str(action_text or "").strip()
+    if not options:
+        return None
+    if re.fullmatch(r"\d+", stripped):
+        valid_indices = {str(option.get("index", "")).strip() for option in options}
+        return stripped if stripped in valid_indices else None
+
+    action_norm = _normalize_text(stripped)
+    action_core = _normalize_text(_strip_parenthetical_details(stripped))
+    for option in options:
+        idx = str(option.get("index", "")).strip()
+        option_text = str(option.get("text", "")).strip()
+        option_norm = _normalize_text(option_text)
+        option_core = _normalize_text(_strip_parenthetical_details(option_text))
+        if action_norm and (action_norm == option_norm or action_norm in option_norm):
+            return idx
+        if action_core and (action_core == option_core or action_core in option_core):
+            return idx
+
+    unique_cores = {
+        _normalize_text(_strip_parenthetical_details(option.get("text", "")))
+        for option in options
+        if option.get("text")
+    }
+    if len(unique_cores) == 1:
+        option_core = next(iter(unique_cores))
+        action_verb = action_core.split(" ", 1)[0] if action_core else ""
+        option_verb = option_core.split(" ", 1)[0] if option_core else ""
+        if action_verb and action_verb == option_verb:
+            return str(options[0].get("index", "")).strip() or None
+    return None
+
+
+CONTAINING_ENTITY_PATTERN = re.compile(
+    r"\b(?P<name>[A-Za-z][A-Za-z0-9 -]{1,60}?)\s*\(containing (?P<contents>[^)]{1,160})\)",
+    re.IGNORECASE,
+)
+
+
+def _content_terms(text: str) -> set:
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "called",
+        "containing",
+        "in",
+        "nothing",
+        "of",
+        "substance",
+        "the",
+    }
+    return {
+        term
+        for term in re.findall(r"[a-z][a-z0-9-]*", str(text or "").lower())
+        if len(term) > 1 and term not in stopwords
+    }
+
+
+def _normalize_surface_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
 
 
-def _webshop_click_target(action_key: str) -> str:
+def _surface_term_set(text: str, *, stopwords: Optional[set] = None) -> set:
+    terms = set()
+    for term in _normalize_surface_key(text).split():
+        if len(term) <= 2 or (stopwords and term in stopwords):
+            continue
+        terms.add(term)
+        if term.endswith("ies") and len(term) > 4:
+            terms.add(term[:-3] + "y")
+        elif term.endswith("s") and not term.endswith("ss") and len(term) > 3:
+            terms.add(term[:-1])
+    return terms
+
+
+def _bracket_action_target(action_key: str) -> str:
     match = re.match(r"^click\[(.*)\]$", action_key, re.IGNORECASE)
-    return _normalize_webshop_key(match.group(1)) if match else ""
+    return _normalize_surface_key(match.group(1)) if match else ""
 
 
 def _is_horizontal_exploration_action(action_key: str, benchmark: str = "generic") -> bool:
@@ -211,9 +256,6 @@ def _is_horizontal_exploration_action(action_key: str, benchmark: str = "generic
         return False
     if key.startswith("search["):
         return True
-    if benchmark == "webshop":
-        target_key = _webshop_click_target(key)
-        return target_key in WEBSHOP_NAV_TARGETS
     return key in {"look", "look around", "inventory"} or key.startswith(
         ("go to ", "teleport ", "move to ")
     )
@@ -224,10 +266,7 @@ def _is_candidate_commit_action(action_key: str, benchmark: str = "generic") -> 
     key = _normalize_text(action_key)
     if not key:
         return False
-    if benchmark == "webshop":
-        target_key = _webshop_click_target(key)
-        return bool(target_key and target_key not in WEBSHOP_NAV_TARGETS)
-    return key.startswith(
+    return key.startswith("click[") or key.startswith(
         (
             "examine ",
             "look at ",
@@ -255,7 +294,7 @@ def _is_candidate_commit_action(action_key: str, benchmark: str = "generic") -> 
 def _snapshot_has_candidates(snapshot: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(snapshot, dict):
         return False
-    candidate_keys = ("webshop_products", "visible_entities")
+    candidate_keys = ("candidates", "products", "visible_entities")
     return any(bool(snapshot.get(key)) for key in candidate_keys)
 
 
@@ -355,13 +394,16 @@ def _extract_candidate_queue(snapshot: Optional[Dict[str, Any]]) -> List[str]:
     if not isinstance(snapshot, dict):
         return []
     candidates: List[str] = []
-    for product in snapshot.get("webshop_products") or []:
+    for candidate in snapshot.get("candidates") or []:
+        candidates.append(str(candidate))
+    for product in snapshot.get("products") or []:
         if not isinstance(product, dict):
+            candidates.append(str(product))
             continue
-        asin = str(product.get("asin", "")).strip()
+        identifier = str(product.get("id", "") or product.get("identifier", "")).strip()
         title = str(product.get("title", "")).strip()
         price = str(product.get("price", "")).strip()
-        label = " | ".join(part for part in (asin, title, price) if part)
+        label = " | ".join(part for part in (identifier, title, price) if part)
         if label:
             candidates.append(label)
     for entity in snapshot.get("visible_entities") or []:
@@ -382,6 +424,11 @@ def build_runtime_protocol_state(
     action = _normalize_text(decision.get("action", ""))
     failure_type = _normalize_text(decision.get("failure_type", decision.get("reason", "")))
     candidates = _extract_candidate_queue(snapshot)
+    completed_actions = snapshot.get("completed_actions") or []
+    focused_targets = snapshot.get("focused_targets") or []
+    last_measurements = snapshot.get("last_measurements") or []
+    object_identity_ledger = snapshot.get("object_identity_ledger") or []
+    visible_actions = [str(item).strip() for item in (snapshot.get("visible_actions") or []) if str(item).strip()][:8]
     trace_actions = [
         _normalize_text(item.get("action", ""))
         for item in trace
@@ -390,7 +437,9 @@ def build_runtime_protocol_state(
     horizontal_steps = sum(1 for item in trace_actions if _is_horizontal_exploration_action(item, benchmark))
     commit_steps = sum(1 for item in trace_actions if _is_candidate_commit_action(item, benchmark))
 
-    if "invalid_action" in failure_type or "stale_state" in failure_type or "precondition" in failure_type:
+    if "selection_acknowledgement_loop" in failure_type:
+        phase = "advance_after_selection"
+    elif "invalid_action" in failure_type or "stale_state" in failure_type or "precondition" in failure_type:
         phase = "recover"
     elif "exploration_without_commit" in failure_type or (candidates and horizontal_steps >= 2 and commit_steps == 0):
         phase = "inspect_or_commit_best_candidate"
@@ -403,12 +452,20 @@ def build_runtime_protocol_state(
 
     next_policy: List[str] = []
     next_policy.append("Preserve hard constraints; do not silently relax them during recovery.")
+    if visible_actions:
+        next_policy.append("Choose the next environment action from the latest visible action set; do not invent actions from older observations.")
     if candidates:
         next_policy.append("Use the candidate queue before widening exploration; reject a candidate only with fresh contradictory evidence.")
     if phase in {"inspect_or_commit_best_candidate", "inspect_candidate"}:
         next_policy.append("Inspect or commit the best-so-far candidate if hard constraints have sufficient evidence and no direct contradiction.")
     if phase == "recover":
         next_policy.append("Repair the smallest failed precondition or stale target; avoid restarting solved phases.")
+    if completed_actions or focused_targets or last_measurements:
+        next_policy.append("Preserve the state ledger: do not redo completed actions, focus targets, or measured facts unless the latest observation explicitly contradicts them.")
+    if object_identity_ledger:
+        next_policy.append("Use observed object-identity evidence such as contents/location to resolve same-name candidates; if identity cannot be distinguished, inspect or refresh rather than guessing.")
+    if phase == "advance_after_selection":
+        next_policy.append("Use the latest observation as the action authority: if a repeated target is still visible, treat the prior click as acknowledged and advance to a different visible next action; if it is no longer visible, treat the target as stale and choose only from visible actions.")
     if not candidates:
         next_policy.append("Explore with rewritten queries/actions first, then relax only soft constraints if no candidates appear.")
 
@@ -418,6 +475,12 @@ def build_runtime_protocol_state(
         "constraints": constraints,
         "evidence_stages": _infer_evidence_stages(constraints),
         "candidates": candidates,
+        "visible_actions": visible_actions,
+        "completed_actions": list(completed_actions)[-8:],
+        "focused_targets": list(focused_targets)[-8:],
+        "last_measurements": list(last_measurements)[-6:],
+        "ambiguous_options": list(snapshot.get("ambiguous_options") or [])[:8],
+        "object_identity_ledger": list(object_identity_ledger)[-8:],
         "tried_actions": list(dict.fromkeys([item for item in trace_actions if item]))[-8:],
         "next_policy": next_policy,
     }
@@ -491,9 +554,6 @@ SKILL_AS_ACTION_PATTERNS = (
     "search-pattern-executor",
 )
 
-SKILL_NAME_PATTERN = re.compile(r"\b(?:alfworld|webshop|scienceworld)-[a-z0-9-]+\b", re.IGNORECASE)
-
-
 def classify_runtime_failure(
     *,
     action: str,
@@ -522,7 +582,6 @@ def classify_runtime_failure(
 
     if (
         any(pattern in action_key for pattern in SKILL_AS_ACTION_PATTERNS)
-        or SKILL_NAME_PATTERN.search(action_key)
         or any(name and name in action_key for name in skill_names)
     ):
         return {
@@ -655,11 +714,21 @@ def infer_runtime_protocol_hints(
             "Resolve ambiguity with only the requested numeric/index response, then resume the same subgoal without changing target semantics."
         )
 
+    if "selection_acknowledgement_loop" in failure_type:
+        add(
+            "A repeated legal selection with unchanged observation should be treated as acknowledged only when the target is still supported by the latest observation; advance to a different visible option, verification action, or final commit instead of repeating it."
+        )
+
     if repeated_actions:
         sample = sorted(repeated_actions)[0]
-        add(
-            f"The action `{sample}` already repeated; before trying it again, change candidate, location, query, or missing precondition."
-        )
+        if _is_candidate_commit_action(sample, str(snapshot.get("benchmark") or "generic")):
+            add(
+                f"The selection/commit action `{sample}` already repeated; do not issue it again. Use the latest observation to choose a different visible option, verification action, navigation action, or final commit."
+            )
+        else:
+            add(
+                f"The action `{sample}` already repeated; before trying it again, change candidate, location, query, or missing precondition."
+            )
 
     return hints
 
@@ -783,6 +852,16 @@ class RuntimeRecompileController:
                 "reason": "horizontal_exploration_without_commit",
                 "repair_hint": "Verify the best-so-far candidate before continuing broad exploration; preserve tried candidates and only resume exploration after that candidate is rejected by fresh observation.",
             }
+        elif reason == "action_loop" and _is_candidate_commit_action(action_key, self.benchmark):
+            classification = {
+                "failure_type": "selection_acknowledgement_loop",
+                "reason": "repeated_selection_without_observable_change",
+                "repair_hint": (
+                    "The repeated legal selection may already be applied even if the observation text did not change. "
+                    "Do not retry the same selection. Continue with the next required option, verification step, or final commit unless the latest observation explicitly rejects the selection."
+                ),
+            }
+            reason = "selection_acknowledgement_loop"
 
         step_index = self.total_steps_before_attempt + self.steps_consumed
         return RuntimeRecompileDecision(
@@ -962,7 +1041,13 @@ class RuntimeRecompileEnvProxy:
         self._open_receptacles: List[str] = []
         self._completed_transfers: List[Dict[str, str]] = []
         self._completed_transforms: List[Dict[str, str]] = []
-        self._webshop_products: List[Dict[str, str]] = []
+        self._completed_actions: List[Dict[str, str]] = []
+        self._focused_targets: List[str] = []
+        self._last_measurements: List[Dict[str, str]] = []
+        self._latest_ambiguous_options: List[Dict[str, str]] = []
+        self._object_identity_ledger: List[Dict[str, Any]] = []
+        self._pending_ambiguous_intent = ""
+        self._last_raw_action_intent = ""
         self._soft_guard_counts: Dict[str, int] = {}
         self._load_state_snapshot(initial_state or {})
 
@@ -977,104 +1062,52 @@ class RuntimeRecompileEnvProxy:
         self._open_receptacles = list(snapshot.get("open_receptacles") or self._open_receptacles)
         self._completed_transfers = list(snapshot.get("completed_transfers") or self._completed_transfers)
         self._completed_transforms = list(snapshot.get("completed_transforms") or self._completed_transforms)
-        self._webshop_products = list(snapshot.get("webshop_products") or self._webshop_products)
+        self._completed_actions = list(snapshot.get("completed_actions") or self._completed_actions)
+        self._focused_targets = list(snapshot.get("focused_targets") or self._focused_targets)
+        self._last_measurements = list(snapshot.get("last_measurements") or self._last_measurements)
+        self._latest_ambiguous_options = list(
+            snapshot.get("ambiguous_options") or self._latest_ambiguous_options
+        )
+        self._object_identity_ledger = list(
+            snapshot.get("object_identity_ledger") or self._object_identity_ledger
+        )
+        self._pending_ambiguous_intent = _coerce_text(
+            snapshot.get("pending_ambiguous_intent", self._pending_ambiguous_intent)
+        )
 
     def _repair_action(self, action_text: str) -> str:
-        if self._benchmark == "webshop":
-            return self._repair_webshop_action(action_text)
-        if self._benchmark != "alfworld":
-            return action_text
-        repaired = _clean_action_phrase(action_text)
-        if not repaired:
-            return action_text
+        if re.fullmatch(r"\d+", str(action_text or "").strip()) and self._pending_ambiguous_intent:
+            intent_resolution = self._resolve_ambiguous_with_identity(self._pending_ambiguous_intent)
+            if intent_resolution is not None:
+                return intent_resolution
+        identity_resolution = self._resolve_ambiguous_with_identity(action_text)
+        if identity_resolution is not None:
+            return identity_resolution
+        ambiguous_resolution = _resolve_ambiguous_followup(action_text, self._latest_ambiguous_options)
+        if ambiguous_resolution is not None:
+            return ambiguous_resolution
+        stripped = _strip_parenthetical_details(action_text)
+        return stripped if stripped else action_text
 
-        pick_up_match = re.match(r"^pick up (.+)$", repaired)
-        if pick_up_match and self._current_location:
-            obj_ref = self._repair_object_reference(pick_up_match.group(1))
-            return f"take {obj_ref} from {self._current_location}"
+    def _execution_controller_hint(self, action_text: str) -> str:
+        if not self._controller.enabled:
+            return ""
+        if self._latest_ambiguous_options and not re.fullmatch(r"\d+", str(action_text or "").strip()):
+            return (
+                "Execution controller hint: the environment is waiting for a numeric index from the active "
+                "ambiguous-choice prompt. Reply with one listed index only; do not issue a different action "
+                "until the ambiguity is resolved."
+            )
+        if re.fullmatch(r"\d+", str(action_text or "").strip()) and not self._latest_ambiguous_options:
+            return (
+                "Execution controller hint: a numeric index is only legal immediately after an active "
+                "ambiguous-choice prompt. The latest observation is not an ambiguity prompt, so refresh "
+                "or issue one concrete legal action from the latest observation instead of sending an orphan index."
+            )
+        return ""
 
-        take_match = re.match(r"^take (.+?) from (.+)$", repaired)
-        if take_match:
-            obj_ref = self._repair_object_reference(take_match.group(1))
-            recep_ref = _clean_action_phrase(take_match.group(2))
-            return f"take {obj_ref} from {recep_ref}"
-
-        move_match = re.match(r"^move (.+?) to (.+)$", repaired)
-        if move_match:
-            obj_ref = self._repair_object_reference(move_match.group(1))
-            recep_ref = _clean_action_phrase(move_match.group(2))
-            return f"move {obj_ref} to {recep_ref}"
-
-        put_match = re.match(r"^put (.+?) (?:on|in|into) (.+)$", repaired)
-        if put_match:
-            obj_ref = self._repair_object_reference(put_match.group(1))
-            recep_ref = _clean_action_phrase(put_match.group(2))
-            return f"move {obj_ref} to {recep_ref}"
-
-        tool_match = re.match(r"^(clean|heat|cool) (.+?) with (.+)$", repaired)
-        if tool_match:
-            verb, obj_ref, recep_ref = tool_match.groups()
-            return f"{verb} {self._repair_object_reference(obj_ref)} with {_clean_action_phrase(recep_ref)}"
-
-        if repaired.startswith("move to "):
-            return f"go to {repaired[8:].strip()}"
-
-        return repaired
-
-    def _repair_webshop_action(self, action_text: str) -> str:
-        text = str(action_text or "").strip()
-        click_match = re.match(r"^click\[(.*)\]$", text, re.IGNORECASE)
-        if not click_match:
-            return text
-        target = click_match.group(1).strip()
-        target_key = _normalize_webshop_key(target)
-        if not target_key:
-            return text
-
-        nav_aliases = {
-            "next": "Next >",
-            ">": "Next >",
-            "next >": "Next >",
-            "prev": "< Prev",
-            "< prev": "< Prev",
-            "previous": "< Prev",
-            "back": "< Prev",
-            "back to results": "< Prev",
-            "< back": "< Prev",
-            "< back to results": "< Prev",
-            "back to search": "Back to Search",
-            "< back to search": "Back to Search",
-            "buy now": "Buy Now",
-        }
-        if target_key in nav_aliases:
-            return f"click[{nav_aliases[target_key]}]"
-        if WEBSHOP_ASIN_PATTERN.fullmatch(target):
-            return text
-
-        best_asin = ""
-        best_score = 0
-        for product in self._webshop_products:
-            asin = product.get("asin", "")
-            title = product.get("title", "")
-            title_key = _normalize_webshop_key(title)
-            if not asin or not title_key:
-                continue
-            if target_key == title_key:
-                best_asin = asin
-                best_score = 10_000
-                break
-            if target_key in title_key or title_key in target_key:
-                score = min(len(target_key), len(title_key))
-            else:
-                target_terms = {term for term in target_key.split() if len(term) > 2}
-                title_terms = {term for term in title_key.split() if len(term) > 2}
-                score = len(target_terms & title_terms)
-            if score > best_score:
-                best_score = score
-                best_asin = asin
-        if best_asin and best_score >= 3:
-            return f"click[{best_asin}]"
-        return text
+    def _note_action_before_step(self, action_text: str):
+        return
 
     def _repair_object_reference(self, obj_ref: str) -> str:
         cleaned = _clean_action_phrase(obj_ref)
@@ -1115,6 +1148,147 @@ class RuntimeRecompileEnvProxy:
         cleaned = _clean_action_phrase(obj_ref)
         self._carried_objects = [item for item in self._carried_objects if item != cleaned]
 
+    def _remember_object_identities(self, observation_text: str):
+        text = str(observation_text or "")
+        if not text:
+            return
+        occurrence_counts: Dict[tuple, int] = {}
+
+        def remember(name: str, contents: str, location: str = ""):
+            obj = _clean_action_phrase(name.split(":")[-1] if ":" in name else name)
+            loc = _clean_action_phrase(location)
+            key = (obj, loc)
+            occurrence_counts[key] = occurrence_counts.get(key, 0) + 1
+            self._remember_object_identity(
+                obj,
+                contents,
+                location=loc,
+                occurrence=occurrence_counts[key],
+            )
+
+        for loc_match in re.finditer(
+            r"\bin (?:the )?([A-Za-z][A-Za-z0-9 -]{1,50}) is:\s*([^.\n]+)",
+            text,
+            re.IGNORECASE,
+        ):
+            location = _clean_action_phrase(loc_match.group(1))
+            body = loc_match.group(2)
+            for entity_match in CONTAINING_ENTITY_PATTERN.finditer(body):
+                remember(entity_match.group("name"), entity_match.group("contents"), location)
+        for entity_match in CONTAINING_ENTITY_PATTERN.finditer(text):
+            name = entity_match.group("name")
+            remember(name, entity_match.group("contents"))
+
+    def _remember_object_identity(
+        self,
+        name: str,
+        contents: str,
+        *,
+        location: str = "",
+        occurrence: int = 0,
+    ):
+        name_clean = _clean_action_phrase(name)
+        content_clean = re.sub(r"\s+", " ", str(contents or "").strip().lower())
+        if not name_clean or not content_clean:
+            return
+        terms = sorted(_content_terms(content_clean))
+        record = {
+            "object": name_clean,
+            "contents": content_clean,
+            "terms": terms,
+            "location": _clean_action_phrase(location),
+            "occurrence": int(occurrence or 0),
+        }
+        key = (record["object"], record["contents"], record["location"], record["occurrence"])
+        existing = [
+            item
+            for item in self._object_identity_ledger
+            if (
+                item.get("object"),
+                item.get("contents"),
+                item.get("location"),
+                item.get("occurrence"),
+            )
+            != key
+        ]
+        existing.append(record)
+        self._object_identity_ledger = existing[-16:]
+
+    def _ambiguous_option_occurrence(self, option: Dict[str, str], obj: str, loc: str) -> int:
+        option_text = str(option.get("text", "") or "")
+        option_index = str(option.get("index", "") or "")
+        option_key = _normalize_text(option_text)
+        obj_key = _normalize_text(obj)
+        loc_key = _normalize_text(loc)
+        count = 0
+        for candidate in self._latest_ambiguous_options:
+            text = str(candidate.get("text", "") or "")
+            text_key = _normalize_text(text)
+            if obj_key and obj_key not in text_key:
+                continue
+            if loc_key and loc_key not in text_key:
+                continue
+            count += 1
+            if str(candidate.get("index", "") or "") == option_index:
+                return count
+        return 0
+
+    def _resolve_ambiguous_with_identity(self, action_text: str) -> Optional[str]:
+        if not self._latest_ambiguous_options or not self._object_identity_ledger:
+            return None
+        action = str(action_text or "").strip()
+        if re.fullmatch(r"\d+", action):
+            return None
+        action_core = _normalize_text(_strip_parenthetical_details(action))
+        action_terms = _content_terms(action)
+        action_core_terms = _content_terms(action_core)
+        identity_term_counts: Dict[str, int] = {}
+        for identity in self._object_identity_ledger:
+            for term in set(identity.get("terms") or []):
+                identity_term_counts[term] = identity_term_counts.get(term, 0) + 1
+        shared_identity_terms = {term for term, count in identity_term_counts.items() if count > 1}
+        target_terms = action_terms - action_core_terms - shared_identity_terms
+        if not action_core or not action_terms:
+            return None
+        scored: List[tuple] = []
+        for option in self._latest_ambiguous_options:
+            option_text = str(option.get("text", "") or "")
+            option_core = _normalize_text(_strip_parenthetical_details(option_text))
+            if not option_core or option_core.split(" ", 1)[0] != action_core.split(" ", 1)[0]:
+                continue
+            score = 0
+            for identity in self._object_identity_ledger:
+                obj = str(identity.get("object") or "")
+                if obj and obj not in option_core:
+                    continue
+                terms = set(identity.get("terms") or [])
+                overlap = len((target_terms or action_terms) & terms)
+                if overlap <= 0:
+                    continue
+                score += 10 * overlap
+                loc = str(identity.get("location") or "")
+                occurrence = int(identity.get("occurrence") or 0)
+                option_occurrence = self._ambiguous_option_occurrence(option, obj, loc)
+                if loc and loc in _normalize_text(option_text):
+                    score += 3
+                if occurrence and option_occurrence:
+                    score += 6 if occurrence == option_occurrence else -6
+                if "inventory" in _normalize_text(option_text):
+                    for completed in reversed(self._completed_actions[-6:]):
+                        completed_action = _normalize_text(completed.get("action", ""))
+                        completed_obs = _normalize_text(completed.get("observation", ""))
+                        if obj and obj in completed_action and terms & _content_terms(completed_action + " " + completed_obs):
+                            score += 2
+                            break
+            if score > 0:
+                scored.append((score, str(option.get("index", "")).strip()))
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        if len(scored) == 1 or scored[0][0] > scored[1][0]:
+            return scored[0][1] or None
+        return None
+
     def _remember_transfer(self, obj_ref: str, destination: str):
         obj_clean = _clean_action_phrase(obj_ref)
         dest_clean = _clean_action_phrase(destination)
@@ -1135,6 +1309,49 @@ class RuntimeRecompileEnvProxy:
             }
         )
 
+    def _remember_completed_action(self, action_text: str, observation_text: str):
+        action_clean = re.sub(r"\s+", " ", str(action_text or "").strip())
+        if not action_clean:
+            return
+        observation_clean = re.sub(r"\s+", " ", str(observation_text or "").strip())[:180]
+        record = {"action": action_clean, "observation": observation_clean}
+        if self._completed_actions and self._completed_actions[-1] == record:
+            return
+        self._completed_actions.append(record)
+        self._completed_actions = self._completed_actions[-12:]
+
+        action_key = _normalize_text(action_clean)
+        focus_match = re.match(r"^focus on (.+)$", action_key)
+        if focus_match:
+            target = _clean_action_phrase(focus_match.group(1))
+            if target and target not in self._focused_targets:
+                self._focused_targets.append(target)
+                self._focused_targets = self._focused_targets[-8:]
+
+        measurement_match = re.search(
+            r"\b(?:temperature|reading|measure(?:s|d)?)\b.*?(-?\d+(?:\.\d+)?)\s*(?:degrees?|celsius|c)\b",
+            str(observation_text or ""),
+            re.IGNORECASE,
+        )
+        if measurement_match:
+            self._last_measurements.append(
+                {
+                    "action": action_clean,
+                    "value": measurement_match.group(1),
+                    "observation": observation_clean,
+                }
+            )
+            self._last_measurements = self._last_measurements[-6:]
+
+    def _observation_is_failure(self, observation_text: str) -> bool:
+        observation_key = _normalize_text(observation_text)
+        if not observation_key:
+            return False
+        if any(marker in observation_key for marker in AMBIGUOUS_MARKERS):
+            return True
+        failure_patterns = FAILURE_PATTERNS.get(self._benchmark) or FAILURE_PATTERNS["generic"]
+        return any(pattern in observation_key for pattern in failure_patterns)
+
     def _build_state_snapshot(self) -> Dict[str, Any]:
         return {
             "benchmark": self._benchmark,
@@ -1146,16 +1363,21 @@ class RuntimeRecompileEnvProxy:
             "open_receptacles": list(self._open_receptacles),
             "completed_transfers": list(self._completed_transfers[-6:]),
             "completed_transforms": list(self._completed_transforms[-6:]),
-            "webshop_products": list(self._webshop_products[:12]),
+            "completed_actions": list(self._completed_actions[-10:]),
+            "focused_targets": list(self._focused_targets[-8:]),
+            "last_measurements": list(self._last_measurements[-6:]),
+            "ambiguous_options": list(self._latest_ambiguous_options[:8]),
+            "object_identity_ledger": list(self._object_identity_ledger[-12:]),
+            "pending_ambiguous_intent": self._pending_ambiguous_intent,
         }
 
     def _update_state_from_action(self, action_text: str, observation_text: str):
-        if self._benchmark != "alfworld":
-            return
+        if not self._observation_is_failure(observation_text):
+            self._remember_completed_action(action_text, observation_text)
         cleaned_action = _clean_action_phrase(action_text)
         observation_key = _normalize_text(observation_text)
         if not cleaned_action or any(
-            pattern in observation_key for pattern in FAILURE_PATTERNS.get("alfworld", ())
+            pattern in observation_key for pattern in (FAILURE_PATTERNS.get(self._benchmark) or FAILURE_PATTERNS["generic"])
         ):
             return
 
@@ -1186,67 +1408,22 @@ class RuntimeRecompileEnvProxy:
         if not normalized_observation:
             return
         self._latest_observation_text = normalized_observation
-        if self._benchmark == "webshop":
-            self._webshop_products = self._extract_webshop_products(normalized_observation)
-            return
-        arrival_match = ALFWORLD_ARRIVAL_PATTERN.search(normalized_observation)
-        if arrival_match:
-            self._current_location = _clean_action_phrase(arrival_match.group(1))
-            self._remember_location(self._current_location)
-        self._latest_visible_entities = [
-            f"{name.strip().lower()} {number}"
-            for name, number in ALFWORLD_VISIBLE_ENTITY_PATTERN.findall(normalized_observation.lower())
-        ]
-        open_match = ALFWORLD_OPEN_PATTERN.search(normalized_observation)
-        if open_match:
-            self._remember_open_receptacle(open_match.group(1))
-        close_match = ALFWORLD_CLOSE_PATTERN.search(normalized_observation)
-        if close_match:
-            self._forget_open_receptacle(close_match.group(1))
-        pickup_match = ALFWORLD_PICKUP_PATTERN.search(normalized_observation)
-        if pickup_match:
-            self._remember_carried_object(
-                f"{pickup_match.group(1).strip().lower()} {pickup_match.group(2)}"
-            )
-        move_match = ALFWORLD_MOVE_PATTERN.search(normalized_observation)
-        if move_match:
-            moved_object = f"{move_match.group(1).strip().lower()} {move_match.group(2)}"
-            destination = move_match.group(3)
-            self._forget_carried_object(moved_object)
-            self._remember_transfer(moved_object, destination)
-
-    def _extract_webshop_products(self, observation_text: str) -> List[Dict[str, str]]:
-        parts = [part.strip() for part in str(observation_text or "").split("[SEP]")]
-        products: List[Dict[str, str]] = []
-        idx = 0
-        while idx < len(parts):
-            token = parts[idx].strip()
-            if WEBSHOP_ASIN_PATTERN.fullmatch(token) and idx + 2 < len(parts):
-                title = parts[idx + 1].strip()
-                price = parts[idx + 2].strip()
-                if title and price.startswith("$"):
-                    products.append({"asin": token, "title": title, "price": price})
-                    idx += 3
-                    continue
-            idx += 1
-        return products
+        self._latest_ambiguous_options = _extract_ambiguous_options(normalized_observation)
+        if self._latest_ambiguous_options:
+            if self._last_raw_action_intent and not re.fullmatch(r"\d+", self._last_raw_action_intent.strip()):
+                self._pending_ambiguous_intent = self._last_raw_action_intent
+        else:
+            self._pending_ambiguous_intent = ""
+        self._remember_object_identities(normalized_observation)
 
     def _build_guard_hint_observation(self, failure_type: str, reason: str, repair_hint: str) -> str:
         candidates = _extract_candidate_queue(self._build_state_snapshot())
-        latest_key = _normalize_text(self._latest_observation_text)
         hints = [
             f"Runtime guard hint: blocked non-executable action ({reason or failure_type}).",
             repair_hint,
             "Continue with one concrete legal environment action from the latest observation.",
         ]
-        if self._benchmark == "webshop":
-            if "buy now" in latest_key:
-                hints.append("If the task is ready, use Action: click[Buy Now].")
-            elif candidates:
-                hints.append(f"Inspect a visible candidate before widening search, for example Action: click[{candidates[0].split(' | ')[0]}].")
-            elif "back to search" in latest_key:
-                hints.append("If no candidate is actionable, use Action: click[Back to Search] or a concrete search[...].")
-        elif self._latest_visible_entities:
+        if self._latest_visible_entities:
             hints.append(f"Use a visible entity/action target such as: {self._latest_visible_entities[0]}.")
         if candidates:
             hints.append("Do not summarize or stop while candidates or final actions remain.")
@@ -1257,6 +1434,7 @@ class RuntimeRecompileEnvProxy:
 
     def step(self, action: Any):
         original_action_text = _extract_action_text(action)
+        self._last_raw_action_intent = original_action_text
         guard = classify_runtime_failure(
             action=original_action_text,
             benchmark=self._benchmark,
@@ -1289,6 +1467,16 @@ class RuntimeRecompileEnvProxy:
                 raise RuntimeSkillRecompileRequested(decision)
 
         repaired_action_text = self._repair_action(original_action_text)
+        controller_hint = self._execution_controller_hint(repaired_action_text)
+        if controller_hint:
+            self._controller.record_guard_hint(
+                action=repaired_action_text,
+                reason="execution_controller",
+                repair_hint=controller_hint,
+            )
+            return self._synthetic_guard_result(controller_hint)
+
+        self._note_action_before_step(repaired_action_text)
         action_payload = action
         if repaired_action_text and repaired_action_text != original_action_text:
             action_payload = _replace_action_text(action, repaired_action_text)
