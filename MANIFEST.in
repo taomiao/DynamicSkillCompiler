@@ -1,0 +1,12 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include src/dynamic_skill_compiler *.py py.typed
+recursive-include tests *.py
+recursive-include reports *.md
+prune experiments/results
+prune results
+prune .cache
+prune .venv-experiments
+prune skillnet-ai
+global-exclude __pycache__ *.py[cod] .DS_Store

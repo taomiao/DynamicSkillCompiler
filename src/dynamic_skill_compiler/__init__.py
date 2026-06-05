@@ -31,6 +31,8 @@ from dynamic_skill_compiler.retriever import (
     SkillRetriever,
 )
 
+__version__ = "0.1.1"
+
 __all__ = [
     "CompilationMetrics",
     "CompiledSkill",
@@ -60,4 +62,5 @@ __all__ = [
     "SemanticSoftMatcher",
     "SUPPORTED_GRAPH_PASSES",
     "TaskDecomposer",
+    "__version__",
 ]

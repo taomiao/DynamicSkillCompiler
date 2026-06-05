@@ -1,19 +1,66 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dynamic-skill-compiler"
-version = "0.1.0"
+version = "0.1.1"
 description = "Task-driven compiler for agent skill libraries."
 readme = "README.md"
-authors = [{ name = "Dynamic Skill Compiler Team" }]
-license = { text = "MIT" }
+authors = [{ name = "taomiao" }]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.9"
-dependencies = [
-    "openai>=1.109.1",
-    "numpy>=1.24",
+keywords = [
+    "agent",
+    "skills",
+    "compiler",
+    "retrieval",
+    "planning",
 ]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "numpy>=1.24",
+    "openai>=1.109.1",
+]
+
+[project.optional-dependencies]
+semantic = [
+    "numpy>=1.24",
+    "openai>=1.109.1",
+]
+dev = [
+    "build>=1.2.1",
+    "twine>=5.1.1",
+]
+all = [
+    "numpy>=1.24",
+    "openai>=1.109.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/taomiao/DynamicSkillCompiler"
+Repository = "https://github.com/taomiao/DynamicSkillCompiler"
+Issues = "https://github.com/taomiao/DynamicSkillCompiler/issues"
+
+[project.scripts]
+dsc = "dynamic_skill_compiler.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+dynamic_skill_compiler = ["py.typed"]
