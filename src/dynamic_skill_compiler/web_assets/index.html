@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dynamic Skill Compiler</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <h1>Dynamic Skill Compiler</h1>
+          <p id="subtitle">Compile a local skill library into a focused execution package.</p>
+        </div>
+        <div class="status" id="status">Ready</div>
+      </section>
+
+      <section class="workspace">
+        <aside class="control-panel">
+          <label>
+            Task
+            <textarea id="query" rows="7">Measure the temperature of the unknown object.</textarea>
+          </label>
+
+          <label>
+            Skills directory
+            <input id="skillsDir" type="text" spellcheck="false" />
+          </label>
+
+          <div class="field-grid">
+            <label>
+              Max selected
+              <input id="maxSelected" type="number" min="0" value="0" />
+            </label>
+            <label>
+              Min relevance
+              <input id="minRelevance" type="number" min="0" max="1" step="0.01" value="0.25" />
+            </label>
+            <label>
+              Preserve top-k
+              <input id="preserveTopK" type="number" min="0" value="2" />
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="loadSkills" class="secondary">Load Skills</button>
+            <button id="compile" class="primary">Compile</button>
+          </div>
+
+          <div class="stats">
+            <div>
+              <span id="candidateCount">0</span>
+              <small>Candidates</small>
+            </div>
+            <div>
+              <span id="selectedCount">0</span>
+              <small>Selected</small>
+            </div>
+            <div>
+              <span id="coverageScore">0.00</span>
+              <small>Coverage</small>
+            </div>
+          </div>
+        </aside>
+
+        <section class="main-panel">
+          <nav class="tabs" aria-label="Views">
+            <button class="tab active" data-view="overview">Overview</button>
+            <button class="tab" data-view="skills">Skills</button>
+            <button class="tab" data-view="passes">Passes</button>
+            <button class="tab" data-view="json">JSON</button>
+          </nav>
+
+          <section id="overview" class="view active">
+            <div class="overview-grid">
+              <section class="panel">
+                <div class="panel-heading">
+                  <h2>Compilation Flow</h2>
+                  <span id="flowMeta">No run yet</span>
+                </div>
+                <div id="flow" class="flow"></div>
+              </section>
+
+              <section class="panel">
+                <div class="panel-heading">
+                  <h2>Execution Order</h2>
+                  <span id="orderMeta">0 skills</span>
+                </div>
+                <ol id="executionOrder" class="order-list"></ol>
+              </section>
+            </div>
+
+            <section class="panel">
+              <div class="panel-heading">
+                <h2>Metrics</h2>
+                <span id="metricMeta">Compiler output</span>
+              </div>
+              <div id="metrics" class="metric-grid"></div>
+            </section>
+          </section>
+
+          <section id="skills" class="view">
+            <div class="skill-columns">
+              <section class="panel">
+                <div class="panel-heading">
+                  <h2>Before Compile</h2>
+                  <span id="beforeMeta">Candidate library</span>
+                </div>
+                <div id="candidateSkills" class="skill-list"></div>
+              </section>
+              <section class="panel">
+                <div class="panel-heading">
+                  <h2>After Compile</h2>
+                  <span id="afterMeta">Selected package</span>
+                </div>
+                <div id="selectedSkills" class="skill-list"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="passes" class="view">
+            <section class="panel">
+              <div class="panel-heading">
+                <h2>Compiler Pass Trace</h2>
+                <span id="passMeta">Selection changes</span>
+              </div>
+              <div id="passTrace" class="pass-list"></div>
+            </section>
+          </section>
+
+          <section id="json" class="view">
+            <section class="panel">
+              <div class="panel-heading">
+                <h2>Raw Response</h2>
+                <button id="copyJson" class="icon-button" title="Copy JSON">Copy</button>
+              </div>
+              <pre id="rawJson">{}</pre>
+            </section>
+          </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

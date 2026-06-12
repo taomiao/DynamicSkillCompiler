@@ -92,6 +92,22 @@ OPENAI_API_KEY=sk-... OPENAI_BASE_URL=https://api.example.com/v1 \
 
 Use `--semantic off` to force local lexical optimization without any prompt.
 
+## Web Workbench
+
+Run the local web service to inspect DSC compilation before and after graph
+passes:
+
+```bash
+dsc-web --host 127.0.0.1 --port 8765 \
+  --skills-dir experiments/src/skills/scienceworld
+```
+
+Then open `http://127.0.0.1:8765`. The workbench exposes:
+
+- `GET /api/skills?skills_dir=...` for local skill-library inspection.
+- `POST /api/compile` for compile runs with candidate skills, selected skills,
+  execution order, compiler pass traces, dropped-skill reasons, and metrics.
+
 ## Build And Publish
 
 Build source and wheel distributions:
