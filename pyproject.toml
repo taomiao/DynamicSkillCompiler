@@ -58,9 +58,10 @@ Issues = "https://github.com/taomiao/DynamicSkillCompiler/issues"
 
 [project.scripts]
 dsc = "dynamic_skill_compiler.cli:main"
+dsc-web = "dynamic_skill_compiler.web:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-dynamic_skill_compiler = ["py.typed"]
+dynamic_skill_compiler = ["py.typed", "web_assets/*.html", "web_assets/*.css", "web_assets/*.js"]
